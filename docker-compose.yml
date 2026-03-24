@@ -1,0 +1,283 @@
+# Test the agent-server image and Nix workspace flow.
+#
+# Usage:
+#   # Build images first:
+#   nix build .#agent-server-image && docker load < result
+#   nix build .#server-image -o result-server-image && docker load < result-server-image
+#
+#   # Start the full OpenHands UI:
+#   docker compose up openhands
+#
+#   # Start the agent-server (base, no extra packages):
+#   docker compose up agent-server
+#
+#   # Start with dynamic Nix packages:
+#   docker compose up agent-server-nix
+#
+#   # Run the test suite:
+#   docker compose up test
+#
+#   # Clean up:
+#   docker compose down
+
+services:
+  # ============================================================
+  # Full OpenHands server (UI + API) on port 3000
+  # ============================================================
+  openhands:
+    image: openhands-server:latest
+    ports:
+      - "3000:3000"
+      # Agent server ports — the frontend connects to these directly via WebSocket.
+      # ProcessSandboxService allocates from base_port=8000 upward.
+      - "8000-8010:8000-8010"
+    extra_hosts:
+      # ProcessSandboxService rewrites localhost → host.docker.internal
+      # when it detects Docker; the agent process runs in this same
+      # container so it must resolve back to 127.0.0.1.
+      - "host.docker.internal:127.0.0.1"
+    environment:
+      - HOME=/root
+      - RUNTIME=nix
+      - SERVE_FRONTEND=true
+      # Workspace directory for the process sandbox
+      - WORKSPACE_BASE=/workspace
+      # AWS credentials from the sidecar (shares network namespace)
+      - AWS_CONTAINER_CREDENTIALS_FULL_URI=http://localhost:9911/credentials
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      # LLM configuration — Bedrock via container credentials
+      - LLM_MODEL=${LLM_MODEL:-bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0}
+      - LLM_API_KEY=unused
+      - LLM_AWS_REGION_NAME=${AWS_REGION:-us-east-1}
+      - AWS_DEFAULT_REGION=${AWS_REGION:-us-east-1}
+      # Nix packages available in the agent sandbox (space-separated flake refs)
+      - NIX_PACKAGES=${NIX_PACKAGES:-}
+      # GitLab token for repo access
+      - GITLAB_TOKEN=${GITLAB_ACCESS_TOKEN:-}
+    volumes:
+      - openhands-workspace:/workspace
+      - openhands-state:/.openhands-state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3000/api/options/models')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+
+  # AWS credentials sidecar — serves local profile credentials
+  # via the container credentials protocol on localhost:9911
+  aws-credentials:
+    image: openhands-server:latest
+    network_mode: "service:openhands"
+    user: "${UID:-1000}:${GID:-1000}"
+    entrypoint: ["python", "/srv/aws-credentials-server.py"]
+    environment:
+      - HOME=/home/user
+      - AWS_PROFILE=${AWS_PROFILE:-claude-code}
+      - CREDENTIALS_PORT=9911
+    volumes:
+      - ${HOME}/.aws/config:/home/user/.aws/config:ro
+      - ${HOME}/.aws/sso:/home/user/.aws/sso:rw
+      - ./pkgs/images/aws-credentials-server.py:/srv/aws-credentials-server.py:ro
+
+  # ============================================================
+  # Agent-server instances (SDK-level workspace backends)
+  # ============================================================
+
+  # Base agent-server — no extra packages
+  agent-server:
+    image: openhands-agent-server:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - HOME=/root
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # Agent-server with dynamic Nix packages
+  agent-server-nix:
+    image: openhands-agent-server:latest
+    ports:
+      - "8001:8000"
+    environment:
+      - HOME=/root
+      - NIX_PACKAGES=nixpkgs#hello nixpkgs#jq
+    # Needs privileges for overlay store mount
+    privileged: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ============================================================
+  # Test runners
+  # ============================================================
+
+  # Test runner — validates the agent-server API
+  test:
+    image: openhands-agent-server:latest
+    depends_on:
+      agent-server:
+        condition: service_healthy
+    entrypoint: ["python", "-c"]
+    command:
+      - |
+        import httpx, sys, json
+
+        host = "http://agent-server:8000"
+        client = httpx.Client(base_url=host, timeout=30)
+
+        print("=== Testing agent-server API ===\n")
+
+        # 1. Health check
+        print("1. Health check...")
+        r = client.get("/health")
+        assert r.status_code == 200, f"Health check failed: {r.status_code}"
+        print("   OK\n")
+
+        # 2. Execute a command
+        print("2. Execute command: echo hello...")
+        r = client.post("/api/bash/start_bash_command", json={
+            "command": "echo hello",
+            "timeout": 10,
+        })
+        assert r.status_code == 200, f"Start command failed: {r.status_code} {r.text}"
+        cmd = r.json()
+        cmd_id = cmd["id"]
+        print(f"   Command ID: {cmd_id}")
+
+        # Poll for output
+        import time
+        stdout = ""
+        for _ in range(20):
+            r = client.get("/api/bash/bash_events/search", params={
+                "command_id__eq": cmd_id,
+                "kind__eq": "BashOutput",
+                "limit": 100,
+            })
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                for item in items:
+                    if "stdout" in item and item["stdout"]:
+                        stdout += item["stdout"]
+                    if "exit_code" in item and item["exit_code"] is not None:
+                        print(f"   Exit code: {item['exit_code']}")
+                        print(f"   Stdout: {stdout.strip()}")
+                        break
+                else:
+                    time.sleep(0.5)
+                    continue
+                break
+            time.sleep(0.5)
+
+        assert "hello" in stdout, f"Expected 'hello' in stdout, got: {stdout!r}"
+        print("   OK\n")
+
+        # 3. Check tools are available (git, tmux, etc.)
+        print("3. Check tools available...")
+        for tool in ["git", "tmux", "bash"]:
+            r = client.post("/api/bash/start_bash_command", json={
+                "command": f"which {tool}",
+                "timeout": 5,
+            })
+            assert r.status_code == 200, f"which {tool} failed: {r.text}"
+            print(f"   {tool}: found")
+        print("   OK\n")
+
+        # 4. File operations via bash (more reliable than upload API)
+        print("4. Write and read a file...")
+        r = client.post("/api/bash/start_bash_command", json={
+            "command": "echo 'nix workspace test' > /workspace/test.txt && cat /workspace/test.txt",
+            "timeout": 5,
+        })
+        assert r.status_code == 200
+        cmd_id = r.json()["id"]
+        stdout = ""
+        for _ in range(20):
+            r = client.get("/api/bash/bash_events/search", params={
+                "command_id__eq": cmd_id, "kind__eq": "BashOutput", "limit": 100,
+            })
+            if r.status_code == 200:
+                for item in r.json().get("items", []):
+                    if item.get("stdout"):
+                        stdout += item["stdout"]
+                    if item.get("exit_code") is not None:
+                        break
+                else:
+                    time.sleep(0.5)
+                    continue
+                break
+            time.sleep(0.5)
+        assert "nix workspace test" in stdout, f"Expected content in: {stdout!r}"
+        print(f"   Content: {stdout.strip()}")
+        print("   OK\n")
+
+        print("=== All tests passed ===")
+
+  # Test runner for dynamic Nix packages
+  test-nix:
+    image: openhands-agent-server:latest
+    depends_on:
+      agent-server-nix:
+        condition: service_healthy
+    entrypoint: ["python", "-c"]
+    command:
+      - |
+        import httpx, time
+
+        host = "http://agent-server-nix:8000"
+        client = httpx.Client(base_url=host, timeout=30)
+
+        print("=== Testing dynamic Nix packages ===\n")
+
+        def run_command(cmd):
+            r = client.post("/api/bash/start_bash_command", json={
+                "command": cmd, "timeout": 10,
+            })
+            assert r.status_code == 200, f"Failed: {r.text}"
+            cmd_id = r.json()["id"]
+            stdout, exit_code = "", None
+            for _ in range(30):
+                r = client.get("/api/bash/bash_events/search", params={
+                    "command_id__eq": cmd_id,
+                    "kind__eq": "BashOutput",
+                    "limit": 100,
+                })
+                if r.status_code == 200:
+                    for item in r.json().get("items", []):
+                        if item.get("stdout"):
+                            stdout += item["stdout"]
+                        if item.get("exit_code") is not None:
+                            exit_code = item["exit_code"]
+                    if exit_code is not None:
+                        break
+                time.sleep(0.5)
+            return stdout.strip(), exit_code
+
+        # Check that hello (from nixpkgs#hello) is available
+        print("1. Check 'hello' command (nixpkgs#hello)...")
+        out, code = run_command("hello")
+        print(f"   Output: {out}")
+        assert code == 0, f"hello exited {code}"
+        assert "Hello" in out
+        print("   OK\n")
+
+        # Check that jq (from nixpkgs#jq) is available
+        print("2. Check 'jq' command (nixpkgs#jq)...")
+        out, code = run_command("echo '{\"a\":1}' | jq .a")
+        print(f"   Output: {out}")
+        assert code == 0, f"jq exited {code}"
+        assert "1" in out
+        print("   OK\n")
+
+        print("=== All Nix package tests passed ===")
+
+volumes:
+  openhands-workspace:
+  openhands-state:

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openhands-nix"
+version = "0.1.0"
+description = "Nix-powered workspace backends for OpenHands"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "openhands-sdk>=1.13.0",
+    "pydantic>=2.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
