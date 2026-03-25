@@ -241,10 +241,10 @@ from openhands.runtime.impl.nix.nix_runtime import NixRuntime" \
 
       # Fix GitLab service: httpx.AsyncClient() has no timeout by default,
       # causing requests to hang indefinitely on slow/unreachable GitLab instances.
-      substituteInPlace $SITE/openhands/integrations/gitlab/gitlab_service.py \
+      substituteInPlace $SITE/openhands/integrations/gitlab/service/base.py \
         --replace-fail \
-          "async with httpx.AsyncClient() as client:" \
-          "async with httpx.AsyncClient(timeout=30.0) as client:"
+          "async with httpx.AsyncClient(verify=httpx_verify_option()) as client:" \
+          "async with httpx.AsyncClient(verify=httpx_verify_option(), timeout=30.0) as client:"
 
       # Fix ProcessSandboxService bugs:
       # 1. _get_process_status: idle server is STATUS_SLEEPING, not STATUS_RUNNING
