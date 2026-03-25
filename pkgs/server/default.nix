@@ -79,6 +79,8 @@ let
       "ipywidgets"
       "qtconsole"
       "poetry"
+      "playwright"
+      "browsergym-core"
     ];
 
     # Relax version pins where nixpkgs has slightly different versions
@@ -128,10 +130,6 @@ let
       anthropic
       google-genai
       lmnr
-
-      # Browser automation (Python lib only, no browser binaries)
-      browsergym-core
-      playwright
 
       # Telemetry
       opentelemetry-api
@@ -240,6 +238,13 @@ from openhands.runtime.impl.nix.nix_runtime import NixRuntime" \
         --replace-fail \
           "working_dir=" \
           "working_dir='/workspace/project',  # was:"
+
+      # Fix GitLab service: httpx.AsyncClient() has no timeout by default,
+      # causing requests to hang indefinitely on slow/unreachable GitLab instances.
+      substituteInPlace $SITE/openhands/integrations/gitlab/gitlab_service.py \
+        --replace-fail \
+          "async with httpx.AsyncClient() as client:" \
+          "async with httpx.AsyncClient(timeout=30.0) as client:"
 
       # Fix ProcessSandboxService bugs:
       # 1. _get_process_status: idle server is STATUS_SLEEPING, not STATUS_RUNNING
