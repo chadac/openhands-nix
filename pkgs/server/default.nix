@@ -232,6 +232,21 @@ from openhands.runtime.impl.nix.nix_runtime import NixRuntime" \
           "os.getenv('RUNTIME') in ('local', 'process')" \
           "os.getenv('RUNTIME') in ('local', 'process', 'nix')"
 
+      # Remove browsing agents from agenthub imports (browsergym not packaged).
+      substituteInPlace $SITE/openhands/agenthub/__init__.py \
+        --replace-fail \
+          "    browsing_agent," \
+          "    # browsing_agent,  # removed: requires browsergym" \
+        --replace-fail \
+          "    visualbrowsing_agent," \
+          "    # visualbrowsing_agent,  # removed: requires browsergym" \
+        --replace-fail \
+          "    'browsing_agent'," \
+          "    # 'browsing_agent'," \
+        --replace-fail \
+          "    'visualbrowsing_agent'," \
+          "    # 'visualbrowsing_agent',"
+
       # Fix ProcessSandboxSpecService: empty working_dir causes mkdir missing operand.
       # Set a proper path for the agent server project workspace directory.
       substituteInPlace $SITE/openhands/app_server/sandbox/process_sandbox_spec_service.py \
