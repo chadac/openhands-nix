@@ -272,6 +272,17 @@ PYEOF
           "                tools.append(BrowserTool)" \
           "                if BrowserTool is not None: tools.append(BrowserTool)"
 
+      # Install the openhands_nix extension package (Kubernetes sandbox service)
+      mkdir -p $SITE/openhands_nix
+      cat > $SITE/openhands_nix/__init__.py <<'PYEOF'
+"""OpenHands Nix extensions — Kubernetes sandbox and other Nix-specific integrations."""
+PYEOF
+      cp ${./kubernetes_sandbox.py} $SITE/openhands_nix/kubernetes_sandbox.py
+
+      # Install the .pth-based registration mechanism for RUNTIME=kubernetes
+      cp ${./register_kubernetes_sandbox.py} $SITE/register_kubernetes_sandbox.py
+      cp ${./openhands-nix-extensions.pth} $SITE/openhands-nix-extensions.pth
+
       # Fix ProcessSandboxSpecService: empty working_dir causes mkdir missing operand.
       # Set a proper path for the agent server project workspace directory.
       substituteInPlace $SITE/openhands/app_server/sandbox/process_sandbox_spec_service.py \

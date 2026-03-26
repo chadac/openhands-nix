@@ -69,8 +69,11 @@
               openhands-agent-server
               openhands-workspace;
 
-            # Container image: nix build .#agent-server-image
+            # Container images: nix build .#agent-server-image
             agent-server-image = agentServerImages.mkAgentServerImage { };
+            agent-server-image-minimal = agentServerImages.mkAgentServerImageMinimal {
+              name = "openhands-agent-server-minimal";
+            };
 
             # OpenHands server (web UI + API)
             openhands-server = serverPackages.backend;

@@ -1,16 +1,21 @@
-# Build an OCI container image for the OpenHands agent-server.
+# Build OCI container images for the OpenHands agent-server sandbox.
 #
-# The image includes the Nix package manager itself, so packages can
-# be installed dynamically at pod startup via the NIX_PACKAGES env var.
-# The base Nix store is baked into the image layers (read-only); an
-# overlay store is set up at runtime for new packages.
+# Two variants mirror upstream:
+#   - minimal: Python + Node.js + git + core tools + Nix
+#   - full:    minimal + OpenVSCode Server + GitHub CLI + Docker CLI
+#
+# Both include the Nix package manager so packages can be installed
+# dynamically at pod startup via the NIX_PACKAGES env var.
 #
 # Usage:
-#   # Build the base image:
+#   # Build the default (full) image:
 #   nix build .#agent-server-image
 #
+#   # Build minimal:
+#   nix build .#agent-server-image-minimal
+#
 #   # Run with dynamic packages:
-#   docker run -e NIX_PACKAGES="nixpkgs#nodejs nixpkgs#ripgrep" agent-server
+#   docker run -e NIX_PACKAGES="nixpkgs#ripgrep" openhands-agent-server
 #
 #   # Or pre-bake extra packages into the image:
 #   mkAgentServerImage { extraPackages = [ pkgs.nodejs ]; }
@@ -26,7 +31,7 @@ let
     sdkPackages.openhands-workspace
   ]);
 
-  # Minimal system packages always present in the workspace
+  # Minimal system packages — matches upstream base-image-minimal
   baseSystemPackages = with pkgs; [
     coreutils
     bash
@@ -39,10 +44,23 @@ let
     gzip
     xz
     which
-    tmux   # required by openhands-tools libtmux
-    procps # required by openhands-tools psutil
-    # Needed for overlay store setup
-    util-linux # mount
+    tmux        # required by openhands-tools libtmux
+    procps      # ps, top — required by psutil
+    util-linux  # mount — needed for overlay store setup
+    curl
+    wget
+    jq
+    nodejs_22   # upstream uses python-nodejs base image
+    uv          # Python package manager (upstream includes uv)
+    gnumake     # build-essential equivalent
+    gcc         # build-essential equivalent
+  ];
+
+  # Additional packages for the full variant — matches upstream base-image
+  fullPackages = with pkgs; [
+    openvscode-server  # VSCode Web IDE
+    gh                 # GitHub CLI
+    docker-client      # Docker CLI (no daemon)
   ];
 
   entrypoint = pkgs.writeShellApplication {
@@ -51,22 +69,14 @@ let
     text = builtins.readFile ./entrypoint.sh;
   };
 
-in
-{
-  # Build a customized agent-server image.
-  #
-  # Arguments:
-  #   name            - image name (default: "openhands-agent-server")
-  #   tag             - image tag (default: "latest")
-  #   extraPackages   - additional Nix packages to bake in (e.g. [ pkgs.nodejs ])
-  #   extraPythonPackages - additional Python packages to bake in
-  #   port            - port the agent-server listens on (default: 8000)
-  mkAgentServerImage = {
+  # Shared image builder used by both variants
+  mkImage = {
     name ? "openhands-agent-server",
     tag ? "latest",
     extraPackages ? [],
     extraPythonPackages ? [],
     port ? 8000,
+    variant ? "full",   # "full" or "minimal"
   }:
   let
     python = if extraPythonPackages == [] then basePython
@@ -77,12 +87,31 @@ in
         sdkPackages.openhands-workspace
       ] ++ extraPythonPackages);
 
-    allPackages = baseSystemPackages ++ [
+    variantPackages = if variant == "full" then fullPackages else [];
+
+    allPackages = baseSystemPackages ++ variantPackages ++ [
       python
       pkgs.nix       # Nix package manager for dynamic installs
       pkgs.cacert    # SSL certificates for fetching from caches
       entrypoint
     ] ++ extraPackages;
+
+    # OpenVSCode Server setup for fakeRootCommands (full variant only)
+    vscodeSetup = lib.optionalString (variant == "full") ''
+      # OpenVSCode Server: symlink into expected location
+      mkdir -p ./openhands/.openvscode-server
+      ln -s ${pkgs.openvscode-server}/lib/openvscode-server/* ./openhands/.openvscode-server/ 2>/dev/null || true
+      # Make 'code' available as a command
+      mkdir -p ./usr/local/bin
+      ln -s ${pkgs.openvscode-server}/bin/openvscode-server ./usr/local/bin/code
+    '';
+
+    vscodeEnv = lib.optionals (variant == "full") [
+      "EDITOR=code"
+      "VISUAL=code"
+      "GIT_EDITOR=code --wait"
+      "OPENVSCODE_SERVER_ROOT=/openhands/.openvscode-server"
+    ];
   in
   pkgs.dockerTools.buildLayeredImage {
     inherit name tag;
@@ -90,7 +119,7 @@ in
     contents = allPackages;
 
     fakeRootCommands = ''
-      mkdir -p ./workspace ./tmp ./root ./etc ./nix/var/nix/db
+      mkdir -p ./workspace/project ./tmp ./root ./etc ./nix/var/nix/db ./openhands
       chmod 1777 ./tmp
 
       # Nix needs these directories to function
@@ -113,6 +142,8 @@ in
       # Nix-specific skills for the agent
       mkdir -p ./root/.openhands/skills
       cp ${skillsDir}/*.md ./root/.openhands/skills/
+
+      ${vscodeSetup}
     '';
 
     config = {
@@ -123,15 +154,26 @@ in
       WorkingDir = "/workspace";
       Env = [
         "HOME=/root"
-        "PATH=${lib.makeBinPath allPackages}:/root/.nix-profile/bin:/usr/bin:/bin"
+        "PATH=${lib.makeBinPath allPackages}:/root/.nix-profile/bin:/usr/local/bin:/usr/bin:/bin"
         "PORT=${toString port}"
         "HOST=0.0.0.0"
         "PYTHONDONTWRITEBYTECODE=1"
         "REPO_ROOT=/workspace"
+        "LC_ALL=C.UTF-8"
+        "LANG=C.UTF-8"
+        "LOG_JSON=true"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         # NIX_PACKAGES is set by KubernetesWorkspace at pod creation time
-      ];
+      ] ++ vscodeEnv;
     };
   };
+
+in
+{
+  # Full variant (default) — matches upstream "base-image"
+  mkAgentServerImage = args: mkImage ({ variant = "full"; } // args);
+
+  # Minimal variant — matches upstream "base-image-minimal"
+  mkAgentServerImageMinimal = args: mkImage ({ variant = "minimal"; } // args);
 }
