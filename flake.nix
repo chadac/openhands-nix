@@ -19,9 +19,15 @@
             import ./overlays/python.nix { inherit pkgs; }
           );
 
+          # browser-use and its deps (uuid7, bubus, cdp-use)
+          browserDeps = import ./pkgs/sdk/browser-deps.nix {
+            inherit lib pythonPackages;
+            inherit (pkgs) fetchurl;
+          };
+
           # SDK packages (openhands-sdk, tools, agent-server, workspace)
           sdkPackages = pkgs.callPackage ./pkgs/sdk {
-            inherit pythonPackages;
+            inherit pythonPackages browserDeps;
           };
 
           # CLI application
@@ -70,9 +76,11 @@
               openhands-workspace;
 
             # Container images: nix build .#agent-server-image
-            agent-server-image = agentServerImages.mkAgentServerImage { };
-            agent-server-image-minimal = agentServerImages.mkAgentServerImageMinimal {
-              name = "openhands-agent-server-minimal";
+            # Default is minimal (no openvscode-server, gh, docker-client).
+            # Use agent-server-image-full for the full variant.
+            agent-server-image = agentServerImages.mkAgentServerImageMinimal { };
+            agent-server-image-full = agentServerImages.mkAgentServerImage {
+              name = "openhands-agent-server-full";
             };
 
             # OpenHands server (web UI + API)

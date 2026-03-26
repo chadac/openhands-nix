@@ -128,6 +128,11 @@ class KubernetesSandboxService(SandboxService):
         )
         self.health_check_path = health_check_path
 
+        # External URL for sandbox Ingress routes
+        self.external_host = os.getenv("SANDBOX_K8S_EXTERNAL_HOST", "")
+        self.ingress_class = os.getenv("SANDBOX_K8S_INGRESS_CLASS", "alb-external")
+        self.ingress_group = os.getenv("SANDBOX_K8S_INGRESS_GROUP", "")
+
         # Initialize K8s client
         try:
             k8s_config.load_incluster_config()
@@ -138,6 +143,7 @@ class KubernetesSandboxService(SandboxService):
 
         self._batch_v1 = client.BatchV1Api()
         self._core_v1 = client.CoreV1Api()
+        self._networking_v1 = client.NetworkingV1Api()
 
     def _label_selector(self, extra: dict[str, str] | None = None) -> str:
         """Build a label selector string for our managed Jobs."""
@@ -151,6 +157,81 @@ class KubernetesSandboxService(SandboxService):
 
     def _service_name(self, sandbox_id: str) -> str:
         return f"oh-sandbox-{sandbox_id}"
+
+    def _ingress_name(self, sandbox_id: str) -> str:
+        return f"oh-sandbox-{sandbox_id}"
+
+    def _sandbox_path_prefix(self, sandbox_id: str) -> str:
+        return f"/sandbox/{sandbox_id}"
+
+    def _sandbox_external_url(self, sandbox_id: str) -> str | None:
+        """Build the externally-routable URL for a sandbox, or None if not configured."""
+        if not self.external_host:
+            return None
+        return f"https://{self.external_host}{self._sandbox_path_prefix(sandbox_id)}"
+
+    def _create_sandbox_ingress(self, sandbox_id: str, labels: dict[str, str]) -> None:
+        """Create a per-sandbox Ingress that routes through the shared ALB."""
+        path_prefix = self._sandbox_path_prefix(sandbox_id)
+        ingress = client.V1Ingress(
+            api_version="networking.k8s.io/v1",
+            kind="Ingress",
+            metadata=client.V1ObjectMeta(
+                name=self._ingress_name(sandbox_id),
+                namespace=self.namespace,
+                labels=labels,
+                annotations={
+                    "alb.ingress.kubernetes.io/group.name": self.ingress_group,
+                    # No OIDC auth — sandbox uses session API key
+                    "alb.ingress.kubernetes.io/auth-type": "none",
+                    # Healthcheck against the sandbox pod (with path prefix)
+                    "alb.ingress.kubernetes.io/healthcheck-path": f"{path_prefix}/health",
+                },
+            ),
+            spec=client.V1IngressSpec(
+                ingress_class_name=self.ingress_class,
+                rules=[
+                    client.V1IngressRule(
+                        host=self.external_host,
+                        http=client.V1HTTPIngressRuleValue(
+                            paths=[
+                                client.V1HTTPIngressPath(
+                                    path=f"{path_prefix}/",
+                                    path_type="Prefix",
+                                    backend=client.V1IngressBackend(
+                                        service=client.V1IngressServiceBackend(
+                                            name=self._service_name(sandbox_id),
+                                            port=client.V1ServiceBackendPort(
+                                                number=_DEFAULT_PORT,
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ],
+                        ),
+                    ),
+                ],
+            ),
+        )
+        try:
+            self._networking_v1.create_namespaced_ingress(
+                namespace=self.namespace,
+                body=ingress,
+            )
+            logger.info("Created sandbox Ingress %s (path=%s/)", sandbox_id, path_prefix)
+        except ApiException as e:
+            logger.warning("Failed to create sandbox Ingress (non-fatal): %s", e)
+
+    def _delete_sandbox_ingress(self, sandbox_id: str) -> None:
+        """Delete the per-sandbox Ingress."""
+        try:
+            self._networking_v1.delete_namespaced_ingress(
+                name=self._ingress_name(sandbox_id),
+                namespace=self.namespace,
+            )
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning("Failed to delete sandbox Ingress %s: %s", sandbox_id, e)
 
     def _sandbox_id_from_job(self, job: client.V1Job) -> str:
         """Extract sandbox ID from Job labels."""
@@ -209,30 +290,41 @@ class KubernetesSandboxService(SandboxService):
 
         if status == SandboxStatus.RUNNING:
             session_api_key = self._extract_session_key(job)
-            # Try to get the Service ClusterIP
-            try:
-                svc = self._core_v1.read_namespaced_service(
-                    name=self._service_name(sandbox_id),
-                    namespace=self.namespace,
-                )
-                cluster_ip = svc.spec.cluster_ip
+
+            # Use external URL (via Ingress) if configured, otherwise ClusterIP
+            external_url = self._sandbox_external_url(sandbox_id)
+            if external_url:
                 exposed_urls = [
                     ExposedUrl(
                         name=AGENT_SERVER,
-                        url=f"http://{cluster_ip}:{_DEFAULT_PORT}",
-                        port=_DEFAULT_PORT,
+                        url=external_url,
+                        port=443,
                     ),
                 ]
-            except ApiException:
-                # Service not found — fall back to pod IP
-                if pod and pod.status and pod.status.pod_ip:
+            else:
+                # Fall back to cluster-internal URL
+                try:
+                    svc = self._core_v1.read_namespaced_service(
+                        name=self._service_name(sandbox_id),
+                        namespace=self.namespace,
+                    )
+                    cluster_ip = svc.spec.cluster_ip
                     exposed_urls = [
                         ExposedUrl(
                             name=AGENT_SERVER,
-                            url=f"http://{pod.status.pod_ip}:{_DEFAULT_PORT}",
+                            url=f"http://{cluster_ip}:{_DEFAULT_PORT}",
                             port=_DEFAULT_PORT,
                         ),
                     ]
+                except ApiException:
+                    if pod and pod.status and pod.status.pod_ip:
+                        exposed_urls = [
+                            ExposedUrl(
+                                name=AGENT_SERVER,
+                                url=f"http://{pod.status.pod_ip}:{_DEFAULT_PORT}",
+                                port=_DEFAULT_PORT,
+                            ),
+                        ]
 
         # Parse creation time
         created_at = datetime.now(timezone.utc)
@@ -324,7 +416,7 @@ class KubernetesSandboxService(SandboxService):
         session_api_key = _generate_session_key()
         key_hash = _hash_session_key(session_api_key)
 
-        image = sandbox_spec_id or get_agent_server_image()
+        image = os.getenv("SANDBOX_K8S_IMAGE") or sandbox_spec_id or get_agent_server_image()
 
         # Build environment variables
         env_vars: dict[str, str] = {
@@ -343,17 +435,25 @@ class KubernetesSandboxService(SandboxService):
         if app_server_host:
             env_vars[_WEBHOOK_CALLBACK_VAR] = f"{app_server_host}/api/v1/webhooks"
 
-        # CORS origins
-        cors_origins = os.getenv("OH_ALLOW_CORS_ORIGINS", "").split(",")
+        # CORS origins — include the external host so browser can reach sandbox
+        cors_origins = [o.strip() for o in os.getenv("OH_ALLOW_CORS_ORIGINS", "").split(",") if o.strip()]
+        if self.external_host:
+            cors_origins.append(f"https://{self.external_host}")
         for idx, origin in enumerate(cors_origins):
-            origin = origin.strip()
-            if origin:
-                env_vars[f"OH_ALLOW_CORS_ORIGINS_{idx}"] = origin
+            env_vars[f"OH_ALLOW_CORS_ORIGINS_{idx}"] = origin
+
+        # Set the external URL so the agent-server configures root_path for
+        # path-based reverse proxy routing (ALB Ingress with /sandbox/<id>/ prefix)
+        external_url = self._sandbox_external_url(sandbox_id)
+        if external_url:
+            env_vars["OH_WEB_URL"] = external_url
 
         # NIX_PACKAGES for dynamic Nix package installation
         nix_packages = os.getenv("SANDBOX_NIX_PACKAGES", "")
         if nix_packages:
             env_vars["NIX_PACKAGES"] = nix_packages
+            # Allow unfree packages (e.g. terraform with BSL license)
+            env_vars["NIXPKGS_ALLOW_UNFREE"] = "1"
 
         # Build Job labels
         labels = {
@@ -470,6 +570,10 @@ class KubernetesSandboxService(SandboxService):
         except ApiException as e:
             logger.warning("Failed to create sandbox Service (non-fatal): %s", e)
 
+        # Create an Ingress for external access (if external_host is configured)
+        if self.external_host and self.ingress_group:
+            self._create_sandbox_ingress(sandbox_id, labels)
+
         return SandboxInfo(
             id=sandbox_id,
             created_by_user_id=None,
@@ -562,6 +666,9 @@ class KubernetesSandboxService(SandboxService):
             if e.status != 404:
                 logger.warning("Failed to delete sandbox Service %s: %s", sandbox_id, e)
 
+        # Delete the Ingress (if it exists)
+        self._delete_sandbox_ingress(sandbox_id)
+
         return deleted
 
 
@@ -589,9 +696,9 @@ class KubernetesSandboxSpecService(SandboxSpecService):
         return SandboxSpecInfoPage(items=[self._default_spec], next_page_id=None)
 
     async def get_sandbox_spec(self, sandbox_spec_id: str) -> SandboxSpecInfo | None:
-        if sandbox_spec_id == self._default_spec.id:
-            return self._default_spec
-        return None
+        # Always return the default spec — sandbox_spec_id from Job labels may
+        # be a short name (e.g. "agent-server") rather than the full image URL.
+        return self._default_spec
 
 
 # ---- Dependency Injection Injectors ----

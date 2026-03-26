@@ -278,10 +278,30 @@ PYEOF
 """OpenHands Nix extensions — Kubernetes sandbox and other Nix-specific integrations."""
 PYEOF
       cp ${./kubernetes_sandbox.py} $SITE/openhands_nix/kubernetes_sandbox.py
+      cp ${./strip_prefix_middleware.py} $SITE/openhands_nix/strip_prefix_middleware.py
 
-      # Install the .pth-based registration mechanism for RUNTIME=kubernetes
-      cp ${./register_kubernetes_sandbox.py} $SITE/register_kubernetes_sandbox.py
-      cp ${./openhands-nix-extensions.pth} $SITE/openhands-nix-extensions.pth
+      # Patch config_from_env() to recognize RUNTIME=kubernetes.
+      # Insert kubernetes sandbox branch before the Docker else fallback.
+      substituteInPlace $SITE/openhands/app_server/config.py \
+        --replace-fail \
+          "config.sandbox = ProcessSandboxServiceInjector()
+        else:" \
+          "config.sandbox = ProcessSandboxServiceInjector()
+        elif os.getenv('RUNTIME') == 'kubernetes':
+            from openhands_nix.kubernetes_sandbox import KubernetesSandboxServiceInjector
+            config.sandbox = KubernetesSandboxServiceInjector()
+        else:"
+
+      # Insert kubernetes sandbox_spec branch before the Docker else fallback.
+      substituteInPlace $SITE/openhands/app_server/config.py \
+        --replace-fail \
+          "config.sandbox_spec = ProcessSandboxSpecServiceInjector()
+        else:" \
+          "config.sandbox_spec = ProcessSandboxSpecServiceInjector()
+        elif os.getenv('RUNTIME') == 'kubernetes':
+            from openhands_nix.kubernetes_sandbox import KubernetesSandboxSpecServiceInjector
+            config.sandbox_spec = KubernetesSandboxSpecServiceInjector()
+        else:"
 
       # Fix ProcessSandboxSpecService: empty working_dir causes mkdir missing operand.
       # Set a proper path for the agent server project workspace directory.

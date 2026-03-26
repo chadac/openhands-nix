@@ -29,13 +29,14 @@ let
     sdkPackages.openhands-tools
     sdkPackages.openhands-agent-server
     sdkPackages.openhands-workspace
+    ps.boto3  # Required by litellm for AWS Bedrock
   ]);
 
   # Minimal system packages — matches upstream base-image-minimal
   baseSystemPackages = with pkgs; [
     coreutils
     bash
-    git
+    gitMinimal  # git without git-p4 (avoids pulling in python 3.13)
     gnused
     gnugrep
     findutils
@@ -50,10 +51,6 @@ let
     curl
     wget
     jq
-    nodejs_22   # upstream uses python-nodejs base image
-    uv          # Python package manager (upstream includes uv)
-    gnumake     # build-essential equivalent
-    gcc         # build-essential equivalent
   ];
 
   # Additional packages for the full variant — matches upstream base-image
@@ -68,6 +65,10 @@ let
     runtimeInputs = baseSystemPackages ++ [ pkgs.nix basePython ];
     text = builtins.readFile ./entrypoint.sh;
   };
+
+  # Lazy Chromium wrapper — downloads from Nix binary cache on first use.
+  # Keeps the image small while supporting browser-use for web browsing.
+  lazyChromium = pkgs.writeShellScriptBin "chromium" (builtins.readFile ./lazy-chromium.sh);
 
   # Shared image builder used by both variants
   mkImage = {
@@ -94,6 +95,7 @@ let
       pkgs.nix       # Nix package manager for dynamic installs
       pkgs.cacert    # SSL certificates for fetching from caches
       entrypoint
+      lazyChromium   # Lazy Chromium — fetched from Nix cache on first browser use
     ] ++ extraPackages;
 
     # OpenVSCode Server setup for fakeRootCommands (full variant only)
@@ -134,10 +136,13 @@ let
       filter-syscalls = false
       NIXCONF
 
-      # Basic /etc files
+      # Basic /etc files — include nixbld users for Nix builds
       echo "root:x:0:0:root:/root:/bin/bash" > ./etc/passwd
+      for i in $(seq 1 10); do
+        echo "nixbld$i:x:$((30000 + i)):30000:Nix build user $i:/var/empty:/bin/nologin" >> ./etc/passwd
+      done
       echo "root:x:0:" > ./etc/group
-      echo "nixbld:x:30000:" >> ./etc/group
+      echo "nixbld:x:30000:$(seq -s, 1 10 | sed 's/[0-9]*/nixbld&/g')" >> ./etc/group
 
       # Nix-specific skills for the agent
       mkdir -p ./root/.openhands/skills

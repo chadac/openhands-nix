@@ -9,8 +9,7 @@
 # Tests are disabled by default (doCheck = false) because the monorepo
 # test suite has many sandbox-incompatible tests (git, docker, network).
 # Import checks validate that packages install correctly.
-# browser-use is skipped for now (requires Playwright/Chromium).
-{ lib, pythonPackages, fetchFromGitHub }:
+{ lib, pythonPackages, fetchFromGitHub, browserDeps }:
 
 let
   version = "1.14.0";
@@ -78,10 +77,17 @@ let
       pydantic
       func-timeout
       tom-swe
-      # browser-use intentionally skipped — requires Playwright/Chromium
+      browserDeps.browser-use
     ];
 
-    pythonRemoveDeps = [ "browser-use" ];
+    # Keep browser_tool_set out of the default agent — Chromium is fetched
+    # lazily on first use and we don't want every conversation to trigger
+    # a download. Browser tools are still registered and available on request.
+    postPatch = ''
+      substituteInPlace openhands/tools/preset/subagents/default.md \
+        --replace-fail "  - browser_tool_set" ""
+    '';
+
     doCheck = false;
 
     pythonImportsCheck = [
@@ -110,15 +116,23 @@ let
       wsproto
     ];
 
-    # Disable browser tools — browser-use requires Playwright/Chromium binaries
-    # which we don't package. The enable_browser flag gates all browser_use imports.
+    # Add StripPrefixMiddleware — AWS ALB doesn't rewrite paths, so when routing
+    # /sandbox/<id>/health to the pod, the pod receives the full path. This
+    # middleware strips the OH_WEB_URL path prefix before FastAPI routes see it.
     postPatch = ''
-      substituteInPlace openhands/agent_server/tool_router.py \
-        --replace-fail "enable_browser=True" "enable_browser=False"
-      substituteInPlace openhands/agent_server/__main__.py \
-        --replace-fail "enable_browser=True" "enable_browser=False"
-      substituteInPlace openhands/agent_server/conversation_router.py \
-        --replace-fail "enable_browser=True" "enable_browser=False"
+      # Copy strip_prefix_middleware into the agent_server package
+      cp ${../server/strip_prefix_middleware.py} openhands/agent_server/strip_prefix_middleware.py
+
+      # Patch api.py to add StripPrefixMiddleware after CORS middleware
+      substituteInPlace openhands/agent_server/api.py \
+        --replace-fail \
+          'app.add_middleware(LocalhostCORSMiddleware, allow_origins=config.allow_cors_origins)' \
+          'app.add_middleware(LocalhostCORSMiddleware, allow_origins=config.allow_cors_origins)
+          # Strip path prefix for ALB-based routing (e.g. /sandbox/<id>/ -> /)
+          from openhands.agent_server.strip_prefix_middleware import StripPrefixMiddleware, get_strip_prefix
+          _prefix = get_strip_prefix()
+          if _prefix:
+              app.add_middleware(StripPrefixMiddleware, prefix=_prefix)'
     '';
 
     doCheck = false;

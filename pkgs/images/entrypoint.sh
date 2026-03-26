@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Entrypoint for the OpenHands agent-server container.
 #
-# Dynamically installs Nix packages before starting the agent-server.
+# Dynamically installs Nix packages in the background while the
+# agent-server starts immediately. This lets the server respond to
+# health checks right away instead of blocking on package downloads.
+#
 # Package requests come via the NIX_PACKAGES environment variable
 # (space-separated list of installables, e.g. "nixpkgs#nodejs nixpkgs#ripgrep").
 #
@@ -46,32 +49,36 @@ setup_overlay_store() {
     fi
 }
 
-# --- Dynamic package installation ---
-install_packages() {
+# --- Background package installation ---
+install_packages_background() {
     local packages="${NIX_PACKAGES:-}"
     if [ -z "$packages" ]; then
-        echo "[entrypoint] No NIX_PACKAGES specified, skipping dynamic install"
         return 0
     fi
 
-    echo "[entrypoint] Installing packages: $packages"
+    echo "[entrypoint] Installing packages in background: $packages"
 
-    # Use nix profile for multi-user or single-user installs
-    # shellcheck disable=SC2086
-    nix profile install --no-write-lock-file $packages
-
-    # Update PATH to include newly installed packages
-    export PATH="$HOME/.nix-profile/bin:$PATH"
-    echo "[entrypoint] Package installation complete"
+    (
+        # shellcheck disable=SC2086
+        if nix profile install --no-write-lock-file --impure $packages 2>&1; then
+            echo "[entrypoint] Background package installation complete"
+        else
+            echo "[entrypoint] WARNING: Background package installation failed"
+        fi
+    ) &
 }
 
 # --- Main ---
 
-# Set up writable Nix store if needed
+# Set up writable Nix store if needed (must be synchronous — overlay mount
+# needs to happen before the server or nix profile install runs)
 if [ -n "${NIX_PACKAGES:-}" ]; then
     setup_overlay_store || true
-    install_packages
+    install_packages_background
 fi
+
+# Ensure nix profile bin is on PATH for the server process
+export PATH="$HOME/.nix-profile/bin:$PATH"
 
 echo "[entrypoint] Starting agent-server on ${HOST}:${PORT}"
 exec python -m openhands.agent_server --host "$HOST" --port "$PORT" "$@"
