@@ -247,6 +247,31 @@ from openhands.runtime.impl.nix.nix_runtime import NixRuntime" \
           "    'visualbrowsing_agent'," \
           "    # 'visualbrowsing_agent',"
 
+      # Stub out BrowserTool (depends on browsergym which is not packaged).
+      # Replace browser.py with a None stub so imports don't fail.
+      cat > $SITE/openhands/agenthub/codeact_agent/tools/browser.py <<'PYEOF'
+# Stubbed out: browsergym is not packaged
+BrowserTool = None
+PYEOF
+
+      # Remove BrowserTool from tools __init__.py exports
+      substituteInPlace $SITE/openhands/agenthub/codeact_agent/tools/__init__.py \
+        --replace-fail \
+          "from .browser import BrowserTool" \
+          "from .browser import BrowserTool  # stubbed: returns None"
+
+      # Guard BrowserTool usage in function_calling.py (skip when None)
+      substituteInPlace $SITE/openhands/agenthub/codeact_agent/function_calling.py \
+        --replace-fail \
+          "elif tool_call.function.name == BrowserTool['function']['name']:" \
+          "elif BrowserTool is not None and tool_call.function.name == BrowserTool['function']['name']:"
+
+      # Guard BrowserTool in codeact_agent.py (skip append when None)
+      substituteInPlace $SITE/openhands/agenthub/codeact_agent/codeact_agent.py \
+        --replace-fail \
+          "                tools.append(BrowserTool)" \
+          "                if BrowserTool is not None: tools.append(BrowserTool)"
+
       # Fix ProcessSandboxSpecService: empty working_dir causes mkdir missing operand.
       # Set a proper path for the agent server project workspace directory.
       substituteInPlace $SITE/openhands/app_server/sandbox/process_sandbox_spec_service.py \
