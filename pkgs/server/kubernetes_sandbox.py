@@ -23,6 +23,7 @@ Configuration via environment variables:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -376,11 +377,27 @@ class KubernetesSandboxService(SandboxService):
             )
         except ApiException as e:
             if e.status == 404:
-                return None
+                # Job is gone (TTL cleanup, manual delete, etc.)
+                # Auto-recreate so users can reconnect to existing conversations
+                logger.info(
+                    "Sandbox Job %s not found — auto-recreating for reconnection",
+                    sandbox_id,
+                )
+                return await self._recreate_sandbox(sandbox_id)
             logger.error("Failed to get sandbox Job %s: %s", sandbox_id, e)
             return None
 
-        return self._job_to_sandbox_info(job)
+        info = self._job_to_sandbox_info(job)
+
+        # If the sandbox is in a terminal state (ERROR), recreate it
+        if info and info.status == SandboxStatus.ERROR:
+            logger.info(
+                "Sandbox Job %s is in ERROR state — auto-recreating for reconnection",
+                sandbox_id,
+            )
+            return await self._recreate_sandbox(sandbox_id)
+
+        return info
 
     async def get_sandbox_by_session_api_key(
         self, session_api_key: str
@@ -404,6 +421,50 @@ class KubernetesSandboxService(SandboxService):
         if info and info.session_api_key != session_api_key:
             return None
         return info
+
+    async def _recreate_sandbox(self, sandbox_id: str) -> SandboxInfo:
+        """Delete stale resources for a sandbox and recreate it with the same ID.
+
+        This enables reconnection: when a user refreshes the page and the
+        original sandbox Job is gone (TTL cleanup, crash, etc.), we create a
+        fresh sandbox so the conversation can resume.
+
+        The new sandbox gets a new session API key, but the upstream router
+        reads the key from the SandboxInfo returned by get_sandbox(), so auth
+        stays consistent.
+        """
+        # Clean up any leftover resources from the old sandbox
+        try:
+            self._batch_v1.delete_namespaced_job(
+                name=self._job_name(sandbox_id),
+                namespace=self.namespace,
+                body=client.V1DeleteOptions(propagation_policy="Background"),
+            )
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning("Failed to delete old Job %s during recreate: %s", sandbox_id, e)
+
+        try:
+            self._core_v1.delete_namespaced_service(
+                name=self._service_name(sandbox_id),
+                namespace=self.namespace,
+            )
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning("Failed to delete old Service %s during recreate: %s", sandbox_id, e)
+
+        self._delete_sandbox_ingress(sandbox_id)
+
+        # Small delay to let K8s propagate the deletion (especially for Jobs
+        # that still exist in a terminal state)
+        await asyncio.sleep(1)
+
+        # Recreate with the same sandbox_id so the conversation record still matches
+        try:
+            return await self.start_sandbox(sandbox_id=sandbox_id)
+        except RuntimeError as e:
+            logger.error("Failed to recreate sandbox %s: %s", sandbox_id, e)
+            return None
 
     async def start_sandbox(
         self,
@@ -447,6 +508,10 @@ class KubernetesSandboxService(SandboxService):
         external_url = self._sandbox_external_url(sandbox_id)
         if external_url:
             env_vars["OH_WEB_URL"] = external_url
+
+        # Expose the conversation URL so the agent can reference it (e.g. in MR descriptions)
+        if self.external_host:
+            env_vars["OPENHANDS_CONVERSATION_URL"] = f"https://{self.external_host}/conversations/{sandbox_id}"
 
         # NIX_PACKAGES for dynamic Nix package installation
         nix_packages = os.getenv("SANDBOX_NIX_PACKAGES", "")

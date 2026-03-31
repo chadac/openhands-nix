@@ -140,7 +140,6 @@ let
       #    Use line-anchored patterns (^) so we don't hit indented code.
       sed -i \
         -e 's/^from browser_use import ActionModel, Agent/# &/' \
-        -e 's/^from browser_use.config import/# &/' \
         -e 's/^from browser_use.llm/# &/' \
         -e 's/^from browser_use.tools.service/# &/' \
         -e 's/^from browser_use.telemetry/# &/' \
