@@ -125,7 +125,7 @@ class KubernetesSandboxService(SandboxService):
         self.namespace = namespace or os.getenv("SANDBOX_K8S_NAMESPACE", "openhands")
         self.host_port = host_port or int(os.getenv("SANDBOX_HOST_PORT", "3000"))
         self.startup_grace_seconds = startup_grace_seconds or float(
-            os.getenv("SANDBOX_STARTUP_GRACE_SECONDS", "60")
+            os.getenv("SANDBOX_STARTUP_GRACE_SECONDS", "300")
         )
         self.health_check_path = health_check_path
 
@@ -292,7 +292,8 @@ class KubernetesSandboxService(SandboxService):
         if status == SandboxStatus.RUNNING:
             session_api_key = self._extract_session_key(job)
 
-            # Use external URL (via Ingress) if configured, otherwise ClusterIP
+            # Use external URL (via Ingress) if configured, otherwise ClusterIP.
+            # The frontend needs the external URL for WebSocket connections.
             external_url = self._sandbox_external_url(sandbox_id)
             if external_url:
                 exposed_urls = [
@@ -528,6 +529,21 @@ class KubernetesSandboxService(SandboxService):
             "openhands.ai/spec-id": image.split("/")[-1].split(":")[0],
         }
 
+        # Volume mounts for the container
+        volume_mounts = []
+
+        # Persistent workspace: mount shared PVC with per-sandbox subPath
+        # so conversation history survives sandbox recreation
+        workspace_pvc = os.getenv("SANDBOX_K8S_WORKSPACE_PVC")
+        if workspace_pvc:
+            volume_mounts.append(
+                client.V1VolumeMount(
+                    name="workspace",
+                    mount_path="/workspace",
+                    sub_path=f"sandboxes/{sandbox_id}",
+                )
+            )
+
         # Container spec
         container = client.V1Container(
             name="agent-server",
@@ -535,6 +551,7 @@ class KubernetesSandboxService(SandboxService):
             image_pull_policy=os.getenv("SANDBOX_K8S_IMAGE_PULL_POLICY", "IfNotPresent"),
             ports=[client.V1ContainerPort(container_port=_DEFAULT_PORT, name="http")],
             env=[client.V1EnvVar(name=k, value=v) for k, v in env_vars.items()],
+            volume_mounts=volume_mounts or None,
             resources=client.V1ResourceRequirements(
                 requests=_env_json("SANDBOX_K8S_RESOURCE_REQUESTS", {"cpu": "250m", "memory": "512Mi"}),
                 limits=_env_json("SANDBOX_K8S_RESOURCE_LIMITS") or None,
@@ -544,7 +561,7 @@ class KubernetesSandboxService(SandboxService):
                 initial_delay_seconds=10,
                 period_seconds=5,
                 timeout_seconds=3,
-                failure_threshold=30,
+                failure_threshold=60,  # 60 * 5s = 300s max
             ),
             liveness_probe=client.V1Probe(
                 http_get=client.V1HTTPGetAction(path="/health", port=_DEFAULT_PORT),
@@ -554,9 +571,22 @@ class KubernetesSandboxService(SandboxService):
             ),
         )
 
+        # Volumes
+        volumes = []
+        if workspace_pvc:
+            volumes.append(
+                client.V1Volume(
+                    name="workspace",
+                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                        claim_name=workspace_pvc,
+                    ),
+                )
+            )
+
         # Pod spec
         pod_spec = client.V1PodSpec(
             containers=[container],
+            volumes=volumes or None,
             restart_policy="Never",
         )
 

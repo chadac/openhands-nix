@@ -317,6 +317,18 @@ PYEOF
           "async with httpx.AsyncClient(verify=httpx_verify_option()) as client:" \
           "async with httpx.AsyncClient(verify=httpx_verify_option(), timeout=30.0) as client:"
 
+      # Fix server-side health check: the upstream code parses conversation_url
+      # (external, behind OAuth) to build /server_info URL. This causes 302
+      # redirects through the ALB's OIDC middleware. Patch to use internal
+      # cluster service URL instead.
+      substituteInPlace $SITE/openhands/server/routes/manage_conversations.py \
+        --replace-fail \
+          "conversation_url = urlparse(app_conversation.conversation_url)" \
+          "_ns = __import__('os').getenv('SANDBOX_K8S_NAMESPACE', 'openhands')" \
+        --replace-fail \
+          "sandbox_info_url = f'{str(conversation_url.scheme)}://{str(conversation_url.netloc)}/server_info'" \
+          "sandbox_info_url = f'http://oh-sandbox-{app_conversation.sandbox_id}.{_ns}.svc.cluster.local:8000/server_info'"
+
       # Fix ProcessSandboxService bugs:
       # 1. _get_process_status: idle server is STATUS_SLEEPING, not STATUS_RUNNING
       # 2. _start_agent_process: stdout/stderr=PIPE without reading causes deadlock
