@@ -16,9 +16,13 @@ Configuration via environment variables:
   SANDBOX_K8S_RESOURCE_REQUESTS — JSON resource requests (default: {"cpu": "250m", "memory": "512Mi"})
   SANDBOX_K8S_RESOURCE_LIMITS — JSON resource limits
   SANDBOX_K8S_IMAGE_PULL_SECRETS — comma-separated list of image pull secret names
-  SANDBOX_K8S_STORAGE_CLASS   — storage class for workspace PVCs (optional)
   SANDBOX_HOST_PORT           — port of the main app server (for webhook callbacks)
   SANDBOX_STARTUP_GRACE_SECONDS — grace period before health check failures → ERROR
+
+  Workspace persistence (pick one):
+  SANDBOX_K8S_WORKSPACE_PVC_TEMPLATE — path to a PVC YAML template for per-sandbox volumes.
+      Template variables: ${sandbox_id}, ${namespace}. Default ships with EBS gp3 / 10Gi.
+  SANDBOX_K8S_WORKSPACE_PVC  — (legacy) name of a shared PVC mounted with per-sandbox subPaths.
 """
 
 from __future__ import annotations
@@ -30,7 +34,11 @@ import os
 import secrets
 import string
 from datetime import datetime, timezone
+from pathlib import Path
+from string import Template
 from typing import Any
+
+import yaml
 
 from kubernetes import client, config as k8s_config
 from kubernetes.client.rest import ApiException
@@ -66,6 +74,7 @@ _SESSION_API_KEY_VAR = "OH_SESSION_API_KEYS_0"
 _WEBHOOK_CALLBACK_VAR = "OH_WEBHOOKS_0_BASE_URL"
 
 _DEFAULT_PORT = 8000
+_DEFAULT_PVC_TEMPLATE = Path(__file__).parent / "workspace-pvc-template.yaml"
 
 
 def _generate_session_key() -> str:
@@ -233,6 +242,67 @@ class KubernetesSandboxService(SandboxService):
         except ApiException as e:
             if e.status != 404:
                 logger.warning("Failed to delete sandbox Ingress %s: %s", sandbox_id, e)
+
+    def _pvc_name(self, sandbox_id: str) -> str:
+        return f"oh-workspace-{sandbox_id}"
+
+    def _load_pvc_template(self) -> str | None:
+        """Load the PVC template string, or None if per-sandbox PVCs are disabled."""
+        template_path = os.getenv("SANDBOX_K8S_WORKSPACE_PVC_TEMPLATE")
+        if template_path == "default":
+            template_path = str(_DEFAULT_PVC_TEMPLATE)
+        if not template_path:
+            return None
+        path = Path(template_path)
+        if not path.is_file():
+            logger.error("PVC template not found: %s", path)
+            return None
+        return path.read_text()
+
+    def _ensure_workspace_pvc(self, sandbox_id: str) -> str | None:
+        """Provision a per-sandbox PVC from the template if it doesn't exist.
+
+        Returns the PVC name to mount, or None if per-sandbox PVCs are disabled.
+        """
+        template_str = self._load_pvc_template()
+        if template_str is None:
+            return None
+
+        rendered = Template(template_str).safe_substitute(
+            sandbox_id=sandbox_id,
+            namespace=self.namespace,
+        )
+        pvc_manifest = yaml.safe_load(rendered)
+        pvc_name = pvc_manifest["metadata"]["name"]
+
+        # Check if PVC already exists (conversation revival)
+        try:
+            self._core_v1.read_namespaced_persistent_volume_claim(
+                name=pvc_name,
+                namespace=self.namespace,
+            )
+            logger.info("Workspace PVC %s already exists — reusing", pvc_name)
+            return pvc_name
+        except ApiException as e:
+            if e.status != 404:
+                logger.error("Failed to check workspace PVC %s: %s", pvc_name, e)
+                return None
+
+        # Create PVC
+        try:
+            self._core_v1.create_namespaced_persistent_volume_claim(
+                namespace=self.namespace,
+                body=pvc_manifest,
+            )
+            logger.info("Created workspace PVC %s for sandbox %s", pvc_name, sandbox_id)
+            return pvc_name
+        except ApiException as e:
+            if e.status == 409:
+                # Race condition — another call created it first
+                logger.info("Workspace PVC %s created concurrently — reusing", pvc_name)
+                return pvc_name
+            logger.error("Failed to create workspace PVC %s: %s", pvc_name, e)
+            return None
 
     def _sandbox_id_from_job(self, job: client.V1Job) -> str:
         """Extract sandbox ID from Job labels."""
@@ -532,17 +602,28 @@ class KubernetesSandboxService(SandboxService):
         # Volume mounts for the container
         volume_mounts = []
 
-        # Persistent workspace: mount shared PVC with per-sandbox subPath
-        # so conversation history survives sandbox recreation
-        workspace_pvc = os.getenv("SANDBOX_K8S_WORKSPACE_PVC")
+        # Workspace persistence: per-sandbox PVC (template) or shared PVC (legacy)
+        workspace_pvc = self._ensure_workspace_pvc(sandbox_id)
         if workspace_pvc:
+            # Per-sandbox PVC — mount the whole volume (no subPath needed)
             volume_mounts.append(
                 client.V1VolumeMount(
                     name="workspace",
                     mount_path="/workspace",
-                    sub_path=f"sandboxes/{sandbox_id}",
                 )
             )
+        else:
+            # Legacy: shared PVC with per-sandbox subPath
+            shared_pvc = os.getenv("SANDBOX_K8S_WORKSPACE_PVC")
+            if shared_pvc:
+                workspace_pvc = shared_pvc
+                volume_mounts.append(
+                    client.V1VolumeMount(
+                        name="workspace",
+                        mount_path="/workspace",
+                        sub_path=f"sandboxes/{sandbox_id}",
+                    )
+                )
 
         # Container spec
         container = client.V1Container(

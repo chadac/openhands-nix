@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: oh-workspace-${sandbox_id}
+  namespace: ${namespace}
+  labels:
+    openhands.ai/managed-by: openhands-nix-kubernetes
+    openhands.ai/sandbox-id: ${sandbox_id}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 10Gi

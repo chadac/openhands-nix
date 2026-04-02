@@ -278,6 +278,7 @@ PYEOF
 """OpenHands Nix extensions — Kubernetes sandbox and other Nix-specific integrations."""
 PYEOF
       cp ${./kubernetes_sandbox.py} $SITE/openhands_nix/kubernetes_sandbox.py
+      cp ${./workspace-pvc-template.yaml} $SITE/openhands_nix/workspace-pvc-template.yaml
       cp ${./strip_prefix_middleware.py} $SITE/openhands_nix/strip_prefix_middleware.py
 
       # Patch config_from_env() to recognize RUNTIME=kubernetes.
