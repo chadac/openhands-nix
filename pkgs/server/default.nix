@@ -352,6 +352,27 @@ PYEOF
         agent_server_url = replace_localhost_hostname_for_docker(agent_server_url)
         return agent_server_url'
 
+      # Fix SPAStaticFiles crash on WebSocket connections.
+      # The catch-all static file mount at "/" receives WebSocket scopes when
+      # Socket.IO doesn't match the path. StaticFiles asserts scope["type"] == "http"
+      # which crashes the connection. Override __call__ to reject non-HTTP scopes.
+      substituteInPlace $SITE/openhands/server/static.py \
+        --replace-fail \
+          'class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope: Scope) -> Response:' \
+          'class SPAStaticFiles(StaticFiles):
+    async def __call__(self, scope: Scope, receive, send) -> None:
+        if scope["type"] != "http":
+            # Reject WebSocket (and other non-HTTP) connections gracefully
+            # instead of hitting the assert in StaticFiles.__call__
+            if scope["type"] == "websocket":
+                await receive()  # consume websocket.connect
+                await send({"type": "websocket.close", "code": 1000})
+            return
+        await super().__call__(scope, receive, send)
+
+    async def get_response(self, path: str, scope: Scope) -> Response:'
+
       # Fix ProcessSandboxService bugs:
       # 1. _get_process_status: idle server is STATUS_SLEEPING, not STATUS_RUNNING
       # 2. _start_agent_process: stdout/stderr=PIPE without reading causes deadlock
