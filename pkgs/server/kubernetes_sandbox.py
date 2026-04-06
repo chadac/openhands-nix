@@ -466,26 +466,17 @@ class KubernetesSandboxService(SandboxService):
         except ApiException as e:
             if e.status == 404:
                 # Job is gone (TTL cleanup, manual delete, etc.)
-                # Auto-recreate so users can reconnect to existing conversations
-                logger.info(
-                    "Sandbox Job %s not found — auto-recreating for reconnection",
-                    sandbox_id,
-                )
-                return await self._recreate_sandbox(sandbox_id)
+                # Return None — callers (e.g. the main server's conversation
+                # listing, webhooks polling) should handle missing sandboxes
+                # gracefully.  Auto-recreation was too aggressive: it fired
+                # for every old/finished conversation, creating a storm of
+                # unwanted Jobs on server restart.
+                logger.debug("Sandbox Job %s not found", sandbox_id)
+                return None
             logger.error("Failed to get sandbox Job %s: %s", sandbox_id, e)
             return None
 
-        info = self._job_to_sandbox_info(job)
-
-        # If the sandbox is in a terminal state (ERROR), recreate it
-        if info and info.status == SandboxStatus.ERROR:
-            logger.info(
-                "Sandbox Job %s is in ERROR state — auto-recreating for reconnection",
-                sandbox_id,
-            )
-            return await self._recreate_sandbox(sandbox_id)
-
-        return info
+        return self._job_to_sandbox_info(job)
 
     async def get_sandbox_by_session_api_key(
         self, session_api_key: str
