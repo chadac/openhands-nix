@@ -330,6 +330,28 @@ PYEOF
           "sandbox_info_url = f'{str(conversation_url.scheme)}://{str(conversation_url.netloc)}/server_info'" \
           "sandbox_info_url = f'http://oh-sandbox-{app_conversation.sandbox_id}.{_ns}.svc.cluster.local:8000/server_info'"
 
+      # Fix _get_agent_server_url: prefer AGENT_SERVER_INTERNAL (cluster-local)
+      # over AGENT_SERVER (external ALB) for server-to-sandbox API calls.
+      # The external URL goes through the ALB which requires OIDC auth,
+      # causing 302 redirects. Internal URLs stay within the cluster.
+      substituteInPlace $SITE/openhands/app_server/app_conversation/live_status_app_conversation_service.py \
+        --replace-fail \
+          'agent_server_url = next(
+            exposed_url.url
+            for exposed_url in exposed_urls
+            if exposed_url.name == AGENT_SERVER
+        )
+        agent_server_url = replace_localhost_hostname_for_docker(agent_server_url)
+        return agent_server_url' \
+          'agent_server_url = next(
+            (exposed_url.url for exposed_url in exposed_urls if exposed_url.name == "AGENT_SERVER_INTERNAL"),
+            next((exposed_url.url for exposed_url in exposed_urls if exposed_url.name == AGENT_SERVER), ""),
+        )
+        if not agent_server_url:
+            agent_server_url = next(exposed_url.url for exposed_url in exposed_urls if exposed_url.name == AGENT_SERVER)
+        agent_server_url = replace_localhost_hostname_for_docker(agent_server_url)
+        return agent_server_url'
+
       # Fix ProcessSandboxService bugs:
       # 1. _get_process_status: idle server is STATUS_SLEEPING, not STATUS_RUNNING
       # 2. _start_agent_process: stdout/stderr=PIPE without reading causes deadlock

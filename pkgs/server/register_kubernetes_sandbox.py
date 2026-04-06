@@ -42,9 +42,32 @@ class _KubernetesConfigHook:
 
         def patched_config_from_env():
             from openhands_nix.kubernetes_sandbox import (
+                AGENT_SERVER_INTERNAL,
                 KubernetesSandboxServiceInjector,
                 KubernetesSandboxSpecServiceInjector,
             )
+            from openhands.app_server.sandbox.sandbox_models import AGENT_SERVER
+            from openhands.app_server.app_conversation.live_status_app_conversation_service import (
+                LiveStatusAppConversationService,
+            )
+
+            # Monkey-patch _get_agent_server_url to prefer the internal
+            # cluster URL over the external (ALB) URL for server-to-sandbox
+            # API calls. The external URL goes through the ALB which may
+            # require OIDC auth or have latency; the internal URL stays
+            # within the cluster.
+            _orig_get_url = LiveStatusAppConversationService._get_agent_server_url
+
+            def _patched_get_agent_server_url(self, sandbox):
+                exposed_urls = sandbox.exposed_urls
+                assert exposed_urls is not None
+                # Prefer AGENT_SERVER_INTERNAL (cluster-local), fall back to AGENT_SERVER
+                for exposed_url in exposed_urls:
+                    if exposed_url.name == AGENT_SERVER_INTERNAL:
+                        return exposed_url.url
+                return _orig_get_url(self, sandbox)
+
+            LiveStatusAppConversationService._get_agent_server_url = _patched_get_agent_server_url
 
             config = _original()
             config.sandbox = KubernetesSandboxServiceInjector()

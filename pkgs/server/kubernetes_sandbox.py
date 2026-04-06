@@ -50,6 +50,10 @@ from openhands.app_server.sandbox.sandbox_models import (
     SandboxPage,
     SandboxStatus,
 )
+
+# Internal URL entry — used by the server for server-to-sandbox API calls
+# (avoids routing through the ALB which may require OIDC auth)
+AGENT_SERVER_INTERNAL = "AGENT_SERVER_INTERNAL"
 from openhands.app_server.sandbox.sandbox_service import SandboxService
 from openhands.app_server.sandbox.sandbox_spec_service import (
     SandboxSpecService,
@@ -232,6 +236,20 @@ class KubernetesSandboxService(SandboxService):
         except ApiException as e:
             logger.warning("Failed to create sandbox Ingress (non-fatal): %s", e)
 
+    def _ensure_sandbox_ingress(self, sandbox_id: str, labels: dict[str, str]) -> None:
+        """Ensure Ingress exists for a running sandbox (idempotent)."""
+        try:
+            self._networking_v1.read_namespaced_ingress(
+                name=self._ingress_name(sandbox_id),
+                namespace=self.namespace,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                logger.info("Sandbox Ingress %s missing — recreating", sandbox_id)
+                self._create_sandbox_ingress(sandbox_id, labels)
+            else:
+                logger.warning("Failed to check sandbox Ingress %s: %s", sandbox_id, e)
+
     def _delete_sandbox_ingress(self, sandbox_id: str) -> None:
         """Delete the per-sandbox Ingress."""
         try:
@@ -362,8 +380,18 @@ class KubernetesSandboxService(SandboxService):
         if status == SandboxStatus.RUNNING:
             session_api_key = self._extract_session_key(job)
 
-            # Use external URL (via Ingress) if configured, otherwise ClusterIP.
-            # The frontend needs the external URL for WebSocket connections.
+            # Build the cluster-internal URL (Service DNS or pod IP)
+            internal_url: str | None = None
+            svc_name = self._service_name(sandbox_id)
+            internal_url = f"http://{svc_name}.{self.namespace}.svc.cluster.local:{_DEFAULT_PORT}"
+
+            # Ensure Ingress exists for running sandboxes (idempotent).
+            # Ingresses can be lost during server restarts or cleanup races.
+            if self.external_host and self.ingress_group:
+                self._ensure_sandbox_ingress(sandbox_id, job.metadata.labels or {})
+
+            # Use external URL (via Ingress) for frontend WebSocket connections,
+            # and internal URL for server-to-sandbox API calls.
             external_url = self._sandbox_external_url(sandbox_id)
             if external_url:
                 exposed_urls = [
@@ -372,31 +400,20 @@ class KubernetesSandboxService(SandboxService):
                         url=external_url,
                         port=443,
                     ),
+                    ExposedUrl(
+                        name=AGENT_SERVER_INTERNAL,
+                        url=internal_url,
+                        port=_DEFAULT_PORT,
+                    ),
                 ]
             else:
-                # Fall back to cluster-internal URL
-                try:
-                    svc = self._core_v1.read_namespaced_service(
-                        name=self._service_name(sandbox_id),
-                        namespace=self.namespace,
-                    )
-                    cluster_ip = svc.spec.cluster_ip
-                    exposed_urls = [
-                        ExposedUrl(
-                            name=AGENT_SERVER,
-                            url=f"http://{cluster_ip}:{_DEFAULT_PORT}",
-                            port=_DEFAULT_PORT,
-                        ),
-                    ]
-                except ApiException:
-                    if pod and pod.status and pod.status.pod_ip:
-                        exposed_urls = [
-                            ExposedUrl(
-                                name=AGENT_SERVER,
-                                url=f"http://{pod.status.pod_ip}:{_DEFAULT_PORT}",
-                                port=_DEFAULT_PORT,
-                            ),
-                        ]
+                exposed_urls = [
+                    ExposedUrl(
+                        name=AGENT_SERVER,
+                        url=internal_url,
+                        port=_DEFAULT_PORT,
+                    ),
+                ]
 
         # Parse creation time
         created_at = datetime.now(timezone.utc)
@@ -562,6 +579,15 @@ class KubernetesSandboxService(SandboxService):
             **get_agent_server_env(),
         }
 
+        # Forward SANDBOX_K8S_ENV_* vars as plain env vars on sandbox pods.
+        # These are non-secret configuration (e.g. GITLAB_HOST) set in the
+        # main server deployment. Secret values are injected via envFrom
+        # referencing the K8s Secret named in SANDBOX_K8S_ENV_SECRET.
+        _ENV_PREFIX = "SANDBOX_K8S_ENV_"
+        for key, value in os.environ.items():
+            if key.startswith(_ENV_PREFIX) and key != "SANDBOX_K8S_ENV_SECRET" and value:
+                env_vars[key[len(_ENV_PREFIX):]] = value
+
         # Webhook callback URL (for the main app server)
         app_server_host = os.getenv("SANDBOX_K8S_APP_SERVER_HOST")
         if app_server_host:
@@ -625,6 +651,20 @@ class KubernetesSandboxService(SandboxService):
                     )
                 )
 
+        # Secret-based env vars (tokens, credentials) — injected via envFrom
+        # so secret values never appear in the Job spec.
+        env_from: list | None = None
+        env_secret = os.getenv("SANDBOX_K8S_ENV_SECRET")
+        if env_secret:
+            env_from = [
+                client.V1EnvFromSource(
+                    secret_ref=client.V1SecretEnvSource(
+                        name=env_secret,
+                        optional=True,
+                    ),
+                ),
+            ]
+
         # Container spec
         container = client.V1Container(
             name="agent-server",
@@ -632,6 +672,7 @@ class KubernetesSandboxService(SandboxService):
             image_pull_policy=os.getenv("SANDBOX_K8S_IMAGE_PULL_POLICY", "IfNotPresent"),
             ports=[client.V1ContainerPort(container_port=_DEFAULT_PORT, name="http")],
             env=[client.V1EnvVar(name=k, value=v) for k, v in env_vars.items()],
+            env_from=env_from,
             volume_mounts=volume_mounts or None,
             resources=client.V1ResourceRequirements(
                 requests=_env_json("SANDBOX_K8S_RESOURCE_REQUESTS", {"cpu": "250m", "memory": "512Mi"}),
@@ -707,7 +748,10 @@ class KubernetesSandboxService(SandboxService):
                 backoff_limit=0,
                 ttl_seconds_after_finished=300,
                 template=client.V1PodTemplateSpec(
-                    metadata=client.V1ObjectMeta(labels=labels),
+                    metadata=client.V1ObjectMeta(
+                        labels=labels,
+                        annotations={"karpenter.sh/do-not-disrupt": "true"},
+                    ),
                     spec=pod_spec,
                 ),
             ),
