@@ -352,6 +352,28 @@ PYEOF
         agent_server_url = replace_localhost_hostname_for_docker(agent_server_url)
         return agent_server_url'
 
+      # Recreate missing sandboxes when a user opens a conversation.
+      # The get_conversation endpoint is user-initiated (not polling), so
+      # it's safe to trigger recreation here.  batch_get_sandboxes (used by
+      # search/list) intentionally does NOT recreate.
+      substituteInPlace $SITE/openhands/server/routes/manage_conversations.py \
+        --replace-fail \
+          'if app_conversation:
+                if (
+                    app_conversation.sandbox_status == SandboxStatus.RUNNING' \
+          'if app_conversation:
+                # Recreate sandbox if missing (user opened conversation)
+                if app_conversation.sandbox_id and app_conversation.sandbox_status in (None, SandboxStatus.MISSING, SandboxStatus.ERROR):
+                    try:
+                        _svc = app_conversation_service.sandbox_service
+                        _recreated = await _svc.get_sandbox(app_conversation.sandbox_id)
+                        if _recreated:
+                            app_conversation = await app_conversation_service.get_app_conversation(conversation_uuid)
+                    except Exception:
+                        pass
+                if (
+                    app_conversation and app_conversation.sandbox_status == SandboxStatus.RUNNING'
+
       # Fix SPAStaticFiles crash on WebSocket connections.
       # The catch-all static file mount at "/" receives WebSocket scopes when
       # Socket.IO doesn't match the path. StaticFiles asserts scope["type"] == "http"
