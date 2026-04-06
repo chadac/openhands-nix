@@ -676,12 +676,10 @@ class KubernetesSandboxService(SandboxService):
                 timeout_seconds=3,
                 failure_threshold=60,  # 60 * 5s = 300s max
             ),
-            liveness_probe=client.V1Probe(
-                http_get=client.V1HTTPGetAction(path="/health", port=_DEFAULT_PORT),
-                initial_delay_seconds=30,
-                period_seconds=30,
-                timeout_seconds=5,
-            ),
+            # No liveness probe — sandbox agent-servers can become
+            # unresponsive during heavy LLM calls, git clones, or nix
+            # builds.  A liveness probe would kill the pod mid-task.
+            # The readiness probe is sufficient for routing.
         )
 
         # Volumes
