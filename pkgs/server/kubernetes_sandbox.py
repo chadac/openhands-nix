@@ -466,17 +466,53 @@ class KubernetesSandboxService(SandboxService):
         except ApiException as e:
             if e.status == 404:
                 # Job is gone (TTL cleanup, manual delete, etc.)
-                # Return None — callers (e.g. the main server's conversation
-                # listing, webhooks polling) should handle missing sandboxes
-                # gracefully.  Auto-recreation was too aggressive: it fired
-                # for every old/finished conversation, creating a storm of
-                # unwanted Jobs on server restart.
-                logger.debug("Sandbox Job %s not found", sandbox_id)
-                return None
+                # Only auto-recreate if a workspace PVC exists for this sandbox,
+                # meaning it had real work worth recovering.  This prevents the
+                # recreation storm on server restart (old conversations without
+                # PVCs are left alone).
+                pvc_name = f"oh-workspace-{sandbox_id}"
+                try:
+                    self._core_v1.read_namespaced_persistent_volume_claim(
+                        name=pvc_name, namespace=self.namespace,
+                    )
+                except ApiException:
+                    logger.debug("Sandbox Job %s not found (no PVC) — skipping", sandbox_id)
+                    return None
+
+                logger.info(
+                    "Sandbox Job %s not found but PVC exists — recreating",
+                    sandbox_id,
+                )
+                return await self._recreate_sandbox(sandbox_id)
             logger.error("Failed to get sandbox Job %s: %s", sandbox_id, e)
             return None
 
         return self._job_to_sandbox_info(job)
+
+    async def batch_get_sandboxes(
+        self, sandbox_ids: list[str],
+    ) -> list[SandboxInfo | None]:
+        """Get sandbox info for multiple IDs without triggering auto-recreation.
+
+        Overrides the base class which calls get_sandbox() per ID (and would
+        auto-recreate missing sandboxes).  This method only returns info for
+        sandboxes that actually have running/suspended Jobs.
+        """
+        results: list[SandboxInfo | None] = []
+        for sandbox_id in sandbox_ids:
+            try:
+                job = self._batch_v1.read_namespaced_job(
+                    name=self._job_name(sandbox_id),
+                    namespace=self.namespace,
+                )
+                results.append(self._job_to_sandbox_info(job))
+            except ApiException as e:
+                if e.status == 404:
+                    results.append(None)
+                else:
+                    logger.error("Failed to get sandbox Job %s: %s", sandbox_id, e)
+                    results.append(None)
+        return results
 
     async def get_sandbox_by_session_api_key(
         self, session_api_key: str
