@@ -70,6 +70,10 @@ let
   # Keeps the image small while supporting browser-use for web browsing.
   lazyChromium = pkgs.writeShellScriptBin "chromium" (builtins.readFile ./lazy-chromium.sh);
 
+  # Lazy OpenVSCode Server wrapper — waits for nix profile install, then
+  # sets up /openhands/.openvscode-server and execs the real binary.
+  lazyVscode = pkgs.writeShellScriptBin "openvscode-server" (builtins.readFile ./lazy-vscode.sh);
+
   # Shared image builder used by both variants
   mkImage = {
     name ? "openhands-agent-server",
@@ -96,6 +100,7 @@ let
       pkgs.cacert    # SSL certificates for fetching from caches
       entrypoint
       lazyChromium   # Lazy Chromium — fetched from Nix cache on first browser use
+      lazyVscode     # Lazy OpenVSCode Server — installed via nix profile at pod startup
     ] ++ extraPackages;
 
     # OpenVSCode Server setup for fakeRootCommands (full variant only)

@@ -184,6 +184,30 @@ class KubernetesSandboxService(SandboxService):
             return None
         return f"https://{self.external_host}{self._sandbox_path_prefix(sandbox_id)}"
 
+    def _get_agent_server_url(self, sandbox: SandboxInfo) -> str:
+        """Get agent server URL, preferring the internal K8s service URL.
+
+        The base class uses AGENT_SERVER (external/ALB URL) which may have
+        path prefixes that the agent-server doesn't handle. For in-cluster
+        health checks, the internal URL is more reliable.
+        """
+        from openhands.app_server.errors import SandboxError
+
+        if not sandbox.exposed_urls:
+            raise SandboxError(f'No exposed URLs for sandbox: {sandbox.id}')
+
+        # Prefer internal URL for in-cluster communication
+        for exposed_url in sandbox.exposed_urls:
+            if exposed_url.name == AGENT_SERVER_INTERNAL:
+                return exposed_url.url
+
+        # Fall back to external URL
+        for exposed_url in sandbox.exposed_urls:
+            if exposed_url.name == AGENT_SERVER:
+                return exposed_url.url
+
+        raise SandboxError(f'No agent server URL found for sandbox: {sandbox.id}')
+
     def _create_sandbox_ingress(self, sandbox_id: str, labels: dict[str, str]) -> None:
         """Create a per-sandbox Ingress that routes through the shared ALB."""
         path_prefix = self._sandbox_path_prefix(sandbox_id)
@@ -217,6 +241,18 @@ class KubernetesSandboxService(SandboxService):
                                             name=self._service_name(sandbox_id),
                                             port=client.V1ServiceBackendPort(
                                                 number=_DEFAULT_PORT,
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                                client.V1HTTPIngressPath(
+                                    path=f"{path_prefix}/vscode/",
+                                    path_type="Prefix",
+                                    backend=client.V1IngressBackend(
+                                        service=client.V1IngressServiceBackend(
+                                            name=self._service_name(sandbox_id),
+                                            port=client.V1ServiceBackendPort(
+                                                number=8001,
                                             ),
                                         ),
                                     ),
@@ -633,7 +669,16 @@ class KubernetesSandboxService(SandboxService):
         if external_url:
             env_vars["OH_WEB_URL"] = external_url
 
-        # Expose the conversation URL so the agent can reference it (e.g. in MR descriptions)
+        # VSCode server base path for path-based routing through ALB
+        if self.external_host:
+            path_prefix = self._sandbox_path_prefix(sandbox_id)
+            env_vars["OH_VSCODE_BASE_PATH"] = f"{path_prefix}/vscode"
+
+        # Expose the sandbox ID so tools can identify this sandbox uniquely.
+        # NOTE: OPENHANDS_CONVERSATION_URL is also set but uses the sandbox_id
+        # in the URL path (the real conversation_id isn't known at sandbox
+        # creation time — it's assigned by the app server afterward).
+        env_vars["OPENHANDS_SANDBOX_ID"] = sandbox_id
         if self.external_host:
             env_vars["OPENHANDS_CONVERSATION_URL"] = f"https://{self.external_host}/conversations/{sandbox_id}"
 
@@ -802,7 +847,10 @@ class KubernetesSandboxService(SandboxService):
             ),
             spec=client.V1ServiceSpec(
                 selector={_LABEL_SANDBOX_ID: sandbox_id},
-                ports=[client.V1ServicePort(port=_DEFAULT_PORT, target_port=_DEFAULT_PORT, name="http")],
+                ports=[
+                    client.V1ServicePort(port=_DEFAULT_PORT, target_port=_DEFAULT_PORT, name="http"),
+                    client.V1ServicePort(port=8001, target_port=8001, name="vscode"),
+                ],
                 type="ClusterIP",
             ),
         )
@@ -852,6 +900,9 @@ class KubernetesSandboxService(SandboxService):
                 body=job,
             )
             logger.info("Resumed sandbox Job %s", sandbox_id)
+            # Recreate the Ingress that was removed during pause
+            if self.external_host and self.ingress_group:
+                self._ensure_sandbox_ingress(sandbox_id, job.metadata.labels or {})
             return True
         except ApiException as e:
             logger.error("Failed to resume sandbox %s: %s", sandbox_id, e)
@@ -880,6 +931,8 @@ class KubernetesSandboxService(SandboxService):
                 body=job,
             )
             logger.info("Paused sandbox Job %s", sandbox_id)
+            # Remove the Ingress while paused — recreated on resume
+            self._delete_sandbox_ingress(sandbox_id)
             return True
         except ApiException as e:
             logger.error("Failed to pause sandbox %s: %s", sandbox_id, e)

@@ -123,6 +123,14 @@ let
       # Copy strip_prefix_middleware into the agent_server package
       cp ${../server/strip_prefix_middleware.py} openhands/agent_server/strip_prefix_middleware.py
 
+      # Patch event_service.py: make subscribe_to_events non-blocking.
+      # The FIFO lock is held for the entire duration of agent.step() (which
+      # includes tool execution — potentially minutes). When a WebSocket
+      # reconnects, subscribe_to_events tries to acquire the same lock on the
+      # asyncio event loop thread, freezing the entire server.
+      ${pythonPackages.python.interpreter} ${./patches/patch-event-service.py} \
+        openhands/agent_server/event_service.py
+
       # Patch api.py to add StripPrefixMiddleware after CORS middleware
       substituteInPlace openhands/agent_server/api.py \
         --replace-fail \

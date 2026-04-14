@@ -1,0 +1,42 @@
+--- a/openhands/agent_server/event_service.py
++++ b/openhands/agent_server/event_service.py
+@@ -339,19 +339,24 @@
+             # Create state snapshot while holding the lock to ensure consistency.
+             # ConversationStateUpdateEvent inherits from Event which has frozen=True
+             # in its model_config, making the snapshot immutable after creation.
+-            with state:
+-                state_update_event = (
+-                    ConversationStateUpdateEvent.from_conversation_state(state)
+-                )
+-
+-            # Send state update outside the lock - the event is frozen (immutable),
+-            # so we don't need to hold the lock during the async send operation.
+-            # This prevents potential deadlocks between the sync FIFOLock and async I/O.
+-            try:
+-                await subscriber(state_update_event)
+-            except Exception as e:
+-                logger.error(
+-                    f"Error sending initial state to subscriber {subscriber_id}: {e}"
+-                )
++            # Non-blocking: try to acquire lock with short timeout.
++            # If the lock is held (e.g. during a long tool execution in
++            # agent.step()), skip the initial snapshot to avoid freezing
++            # the event loop.
++            state_update_event = None
++            if state._lock.acquire(blocking=True, timeout=0.5):
++                try:
++                    state_update_event = (
++                        ConversationStateUpdateEvent.from_conversation_state(state)
++                    )
++                finally:
++                    state._lock.release()
++
++            if state_update_event is not None:
++                try:
++                    await subscriber(state_update_event)
++                except Exception as e:
++                    logger.error(
++                        f"Error sending initial state to subscriber {subscriber_id}: {e}"
++                    )
+ 
+         return subscriber_id

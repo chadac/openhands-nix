@@ -68,6 +68,24 @@ install_packages_background() {
     ) &
 }
 
+# --- OpenVSCode Server lazy setup ---
+# VSCodeService checks /openhands/.openvscode-server/bin/openvscode-server
+# at startup. We point it to the lazy wrapper so it passes the check, and
+# the wrapper blocks until the real binary is installed via nix profile.
+setup_lazy_vscode() {
+    if [ -d /openhands/.openvscode-server ]; then
+        # Full variant — already set up with real binary in image
+        return 0
+    fi
+    local wrapper
+    wrapper="$(command -v openvscode-server 2>/dev/null || true)"
+    if [ -n "$wrapper" ]; then
+        mkdir -p /openhands/.openvscode-server/bin
+        ln -sf "$wrapper" /openhands/.openvscode-server/bin/openvscode-server
+        echo "[entrypoint] Lazy OpenVSCode Server wrapper installed"
+    fi
+}
+
 # --- Main ---
 
 # Set up writable Nix store if needed (must be synchronous — overlay mount
@@ -76,6 +94,9 @@ if [ -n "${NIX_PACKAGES:-}" ]; then
     setup_overlay_store || true
     install_packages_background
 fi
+
+# Set up lazy VS Code wrapper before server starts
+setup_lazy_vscode
 
 # Ensure nix profile bin is on PATH for the server process
 export PATH="$HOME/.nix-profile/bin:$PATH"
