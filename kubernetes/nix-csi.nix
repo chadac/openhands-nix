@@ -243,6 +243,7 @@ in
                       --out-link /nix-volume/nix/var/result \
                       --fallback
                     mkdir -p /nix-volume/nix/var/nix/gcroots/nix-csi
+                    mkdir -p /nix-volume/nix/var/nix-csi/volumes
                   ''
                 ];
                 securityContext.privileged = true;
