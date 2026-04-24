@@ -365,6 +365,12 @@ in
     hash = "sha256-k7AofOStQIkwj75XRbi/1js55EWm84kUdOqEkShKI+M=";
   };
 
+  # whisper: tests import numba/llvmlite which require JIT execution,
+  # failing in the nix sandbox.
+  whisper = prev.whisper.overridePythonAttrs (old: {
+    doCheck = false;
+  });
+
   # ============================================================
   # Server (openhands-ai) dependencies
   # ============================================================
