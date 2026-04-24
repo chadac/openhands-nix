@@ -4,9 +4,13 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    kubenix = {
+      url = "github:hall/kubenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-parts }:
+  outputs = inputs@{ self, nixpkgs, flake-parts, kubenix }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
@@ -106,5 +110,22 @@
             openhands-frontend = serverPackages.frontend;
           } // sdkTests;
         };
+
+      flake = {
+        # Kubenix module for deploying OpenHands on Kubernetes
+        kubenixModules.openhands = ./kubernetes;
+
+        # Helper: evaluate kubenix modules with a given configuration
+        lib.mkOpenhandsManifests = { system ? "x86_64-linux", module }:
+          let
+            pkgs = import nixpkgs { inherit system; };
+          in
+          kubenix.evalModules.${system} {
+            modules = [
+              ./kubernetes
+              module
+            ];
+          };
+      };
     };
 }
