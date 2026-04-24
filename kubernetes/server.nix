@@ -20,19 +20,23 @@ in
   options.openhands.server = with lib; {
     enable = mkEnableOption "OpenHands server";
 
-    image = mkOption {
+    # --- nix-csi: flake ref for the server environment ---
+    flakeRef = mkOption {
       type = types.str;
-      description = "Server container image";
+      description = "Nix flake reference for the server environment (e.g. github:chadac/openhands-nix#openhands-server)";
     };
 
-    imageTag = mkOption {
+    # Base image — only needs a shell and basic userland.
+    # nix-csi mounts /nix with the actual server packages.
+    baseImage = mkOption {
       type = types.str;
-      default = "latest";
+      default = "nixos/nix:latest";
+      description = "Minimal base image (provides /bin/sh, coreutils). Server runs from /nix via CSI.";
     };
 
-    imagePullPolicy = mkOption {
+    csiDriverName = mkOption {
       type = types.str;
-      default = "Always";
+      default = "nix.csi.store";
     };
 
     replicas = mkOption {
@@ -48,7 +52,7 @@ in
     llm = {
       model = mkOption {
         type = types.str;
-        default = "bedrock/us.anthropic.claude-opus-4-6-v1";
+        default = "bedrock/us.anthropic.claude-sonnet-4-20250514";
       };
       awsRegion = mkOption {
         type = types.str;
@@ -83,14 +87,8 @@ in
     };
 
     sandbox = {
-      image = mkOption {
-        type = types.str;
-        description = "Agent-server image for sandbox pods";
-      };
-      imageTag = mkOption {
-        type = types.str;
-        default = "latest";
-      };
+      # Sandbox pods also use nix-csi — no image needed.
+      # The server's NixCSIWorkspace handles volume spec generation.
       nixPackages = mkOption {
         type = types.str;
         default = "nixpkgs#awscli2 nixpkgs#kubectl nixpkgs#python312 nixpkgs#nodejs_22 nixpkgs#jq nixpkgs#ripgrep nixpkgs#gh";
@@ -248,7 +246,7 @@ in
               serviceAccountName = name;
               initContainers = [{
                 name = "seed-settings";
-                image = "busybox:1.36";
+                image = cfg.baseImage;
                 command = [ "sh" "-c" ];
                 args = [
                   ''
@@ -266,8 +264,8 @@ in
               }];
               containers = [{
                 inherit name;
-                image = "${cfg.image}:${cfg.imageTag}";
-                imagePullPolicy = cfg.imagePullPolicy;
+                image = cfg.baseImage;
+                command = [ "/nix/var/result/bin/openhands-server-entrypoint" ];
                 ports = [{
                   name = "http";
                   containerPort = 3000;
@@ -276,8 +274,6 @@ in
                 env = [
                   { name = "RUNTIME"; value = "kubernetes"; }
                   { name = "SANDBOX_K8S_NAMESPACE"; value = namespace; }
-                  { name = "SANDBOX_K8S_IMAGE"; value = "${cfg.sandbox.image}:${cfg.sandbox.imageTag}"; }
-                  { name = "SANDBOX_K8S_IMAGE_PULL_POLICY"; value = "Always"; }
                   { name = "SANDBOX_K8S_RESOURCE_REQUESTS"; value = cfg.sandbox.resourceRequests; }
                   { name = "SANDBOX_K8S_RESOURCE_LIMITS"; value = cfg.sandbox.resourceLimits; }
                   { name = "SANDBOX_NIX_PACKAGES"; value = cfg.sandbox.nixPackages; }
@@ -287,6 +283,8 @@ in
                   { name = "LLM_API_KEY"; value = "unused"; }
                   { name = "LLM_AWS_REGION_NAME"; value = cfg.llm.awsRegion; }
                   { name = "AWS_DEFAULT_REGION"; value = cfg.llm.awsRegion; }
+                  { name = "ENABLE_BROWSER"; value = "false"; }
+                  { name = "SKIP_DEPENDENCY_CHECK"; value = "1"; }
                   {
                     name = "GITHUB_TOKEN";
                     valueFrom.secretKeyRef = {
@@ -298,8 +296,8 @@ in
                 ];
                 startupProbe = {
                   httpGet = { path = "/"; port = "http"; };
-                  failureThreshold = 30;
-                  periodSeconds = 5;
+                  failureThreshold = 60;
+                  periodSeconds = 10;
                 };
                 livenessProbe = {
                   httpGet = { path = "/"; port = "http"; };
@@ -319,11 +317,23 @@ in
                   };
                 };
                 volumeMounts = [
+                  { name = "nix-env"; mountPath = "/nix"; readOnly = true; }
                   { name = "workspace"; mountPath = "/opt/workspace_base"; }
                   { name = "openhands-home"; mountPath = "/root/.openhands"; }
                 ];
               }];
               volumes = [
+                # nix-csi ephemeral volume — builds/fetches the server flake on the node
+                {
+                  name = "nix-env";
+                  csi = {
+                    driver = cfg.csiDriverName;
+                    readOnly = true;
+                    volumeAttributes = {
+                      flakeRef = cfg.flakeRef;
+                    };
+                  };
+                }
                 { name = "workspace"; emptyDir = {}; }
                 { name = "openhands-home"; emptyDir = {}; }
                 {
