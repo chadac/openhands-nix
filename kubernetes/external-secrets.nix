@@ -1,22 +1,20 @@
-# ExternalSecrets kubenix module
+# ExternalSecrets easykubenix module
 #
-# Deploys the ExternalSecrets operator (via Helm) and creates
-# SecretStore + ExternalSecret resources to sync secrets from
-# AWS Secrets Manager into Kubernetes.
+# Creates ServiceAccount, SecretStore, and ExternalSecret resources
+# to sync secrets from AWS Secrets Manager into Kubernetes.
 #
-# NOTE: This module uses kubenix's Helm integration to deploy the
-# external-secrets operator chart, and raw k8s resources for the
-# SecretStore and ExternalSecret CRDs.
+# Prerequisites:
+#   - ExternalSecrets operator must be installed separately
+#     (e.g. via helm install external-secrets external-secrets/external-secrets)
+#   - The CRDs (ClusterSecretStore, ExternalSecret) must exist in the cluster
 #
-{ config, lib, kubenix, ... }:
+{ config, lib, ... }:
 
 let
   cfg = config.openhands.externalSecrets;
   namespace = config.openhands.namespace;
 in
 {
-  imports = [ kubenix.modules.k8s ];
-
   options.openhands.externalSecrets = with lib; {
     enable = mkEnableOption "ExternalSecrets operator + AWS Secrets Manager sync";
 
@@ -36,7 +34,6 @@ in
       description = "AWS Secrets Manager path prefix (e.g. dev/openhands)";
     };
 
-    # Map of ExternalSecret name -> AWS secret key -> K8s secret data key
     secrets = mkOption {
       type = types.attrsOf (types.submodule {
         options = {
@@ -61,37 +58,23 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    kubernetes.resources = {
-      # --- ServiceAccount for ExternalSecrets operator ---
-      serviceAccounts.external-secrets = {
-        metadata = {
-          namespace = "external-secrets";
-          annotations = {
-            "eks.amazonaws.com/role-arn" = cfg.irsaRoleArn;
-          };
-        };
-      };
-
-      namespaces.external-secrets = {};
-
-      # --- Custom resources (SecretStore + ExternalSecrets) ---
-      # These use the kubernetes.customResources mechanism since they're CRDs.
+    # Register CRD apiVersions so easykubenix knows how to render them
+    kubernetes.apiMappings = {
+      ClusterSecretStore = "external-secrets.io/v1beta1";
+      ExternalSecret = "external-secrets.io/v1beta1";
     };
 
-    # SecretStore and ExternalSecret are CRDs — we define them as custom types.
-    # For now, we output them as part of the manifest and they'll be applied
-    # after the external-secrets operator is running.
-    #
-    # TODO: Use kubenix's CRD support once external-secrets CRDs are generated.
-    # For the initial deployment, the operator + CRDs should be installed first
-    # (e.g. via `helm install external-secrets external-secrets/external-secrets`)
-    # and then these resources can be applied.
-    kubernetes.customResources.secret-stores = lib.mkIf cfg.enable [{
-      apiVersion = "external-secrets.io/v1beta1";
-      kind = "ClusterSecretStore";
-      metadata.name = "aws-secrets-manager";
-      spec = {
-        provider.aws = {
+    kubernetes.resources = {
+      # ServiceAccount for ExternalSecrets operator (in its own namespace)
+      none.Namespace.external-secrets = {};
+
+      external-secrets.ServiceAccount.external-secrets = {
+        metadata.annotations."eks.amazonaws.com/role-arn" = cfg.irsaRoleArn;
+      };
+
+      # ClusterSecretStore (cluster-scoped)
+      none.ClusterSecretStore.aws-secrets-manager = {
+        spec.provider.aws = {
           service = "SecretsManager";
           region = cfg.awsRegion;
           auth.jwt.serviceAccountRef = {
@@ -100,16 +83,10 @@ in
           };
         };
       };
-    }];
-
-    kubernetes.customResources.external-secrets = lib.mkIf cfg.enable
-      (lib.mapAttrsToList (name: secret: {
-        apiVersion = "external-secrets.io/v1beta1";
-        kind = "ExternalSecret";
-        metadata = {
-          inherit (config.openhands) namespace;
-          inherit name;
-        };
+    } // lib.mapAttrs' (_name: secret: {
+      # ExternalSecret resources go in the openhands namespace
+      name = namespace;
+      value.ExternalSecret.${_name} = {
         spec = {
           refreshInterval = "1h";
           secretStoreRef = {
@@ -128,6 +105,7 @@ in
             };
           }) secret.keys;
         };
-      }) cfg.secrets);
+      };
+    }) cfg.secrets;
   };
 }

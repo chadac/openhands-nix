@@ -1,4 +1,4 @@
-# OpenHands server kubenix module
+# OpenHands server easykubenix module
 #
 # Deploys the OpenHands server (UI + API) as a Kubernetes Deployment with:
 #   - ServiceAccount with IRSA annotation for Bedrock access
@@ -7,7 +7,7 @@
 #   - Service (ClusterIP)
 #   - Ingress (ALB with optional Cognito OIDC auth)
 #
-{ config, lib, kubenix, ... }:
+{ config, lib, ... }:
 
 let
   cfg = config.openhands.server;
@@ -20,26 +20,13 @@ let
   containerImage = if useNixCsi then cfg.baseImage else "${cfg.image}:${cfg.imageTag}";
   containerCommand = if useNixCsi then [ "/nix/var/result/bin/openhands-server-entrypoint" ] else null;
 
-  # Extra volume + mount for nix-csi mode
-  nixCsiVolume = {
-    name = "nix-env";
-    csi = {
-      driver = cfg.csiDriverName;
-      readOnly = true;
-      volumeAttributes.flakeRef = cfg.flakeRef;
-    };
-  };
-  nixCsiMount = { name = "nix-env"; mountPath = "/nix"; readOnly = true; };
-
   # Sandbox image env vars (only in image mode)
-  sandboxImageEnvs = lib.optionals (!useNixCsi) [
-    { name = "SANDBOX_K8S_IMAGE"; value = "${cfg.sandbox.image}:${cfg.sandbox.imageTag}"; }
-    { name = "SANDBOX_K8S_IMAGE_PULL_POLICY"; value = cfg.imagePullPolicy; }
-  ];
+  sandboxImageEnvs = lib.optionalAttrs (!useNixCsi) {
+    SANDBOX_K8S_IMAGE.value = "${cfg.sandbox.image}:${cfg.sandbox.imageTag}";
+    SANDBOX_K8S_IMAGE_PULL_POLICY.value = cfg.imagePullPolicy;
+  };
 in
 {
-  imports = [ kubenix.modules.k8s ];
-
   options.openhands.server = with lib; {
     enable = mkEnableOption "OpenHands server";
 
@@ -80,8 +67,8 @@ in
 
     baseImage = mkOption {
       type = types.str;
-      default = "nixos/nix:latest";
-      description = "Minimal base image for nix-csi mode (provides /bin/sh, coreutils)";
+      default = "ghcr.io/lillecarl/nix-csi/scratch:1.0.1";
+      description = "Minimal base image for nix-csi mode (sets PATH to /nix/var/result/bin)";
     };
 
     csiDriverName = mkOption {
@@ -201,23 +188,14 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    kubernetes.resources = {
-      # --- Namespace ---
-      namespaces.${namespace} = {};
-
+    kubernetes.resources.${namespace} = {
       # --- ServiceAccount ---
-      serviceAccounts.${name} = {
-        metadata = {
-          inherit namespace;
-          annotations = {
-            "eks.amazonaws.com/role-arn" = cfg.irsaRoleArn;
-          };
-        };
+      ServiceAccount.${name} = {
+        metadata.annotations."eks.amazonaws.com/role-arn" = cfg.irsaRoleArn;
       };
 
       # --- RBAC: sandbox manager ---
-      roles.openhands-sandbox-manager = {
-        metadata.namespace = namespace;
+      Role.openhands-sandbox-manager = {
         rules = [
           {
             apiGroups = [ "batch" ];
@@ -252,22 +230,19 @@ in
         ];
       };
 
-      roleBindings.openhands-sandbox-manager = {
-        metadata.namespace = namespace;
+      RoleBinding.openhands-sandbox-manager = {
         roleRef = {
           apiGroup = "rbac.authorization.k8s.io";
           kind = "Role";
           name = "openhands-sandbox-manager";
         };
-        subjects = [{
-          kind = "ServiceAccount";
-          inherit name namespace;
-        }];
+        subjects = lib.mkNamedList {
+          ${name}.kind = "ServiceAccount";
+        };
       };
 
       # --- ConfigMap: default settings ---
-      configMaps.openhands-default-settings = {
-        metadata.namespace = namespace;
+      ConfigMap.openhands-default-settings = {
         data."settings.json" = builtins.toJSON {
           language = "en";
           agent = cfg.defaultSettings.agent;
@@ -286,11 +261,8 @@ in
       };
 
       # --- Deployment ---
-      deployments.${name} = {
-        metadata = {
-          inherit namespace;
-          labels.app = name;
-        };
+      Deployment.${name} = {
+        metadata.labels.app = name;
         spec = {
           replicas = cfg.replicas;
           strategy.type = "Recreate";
@@ -302,156 +274,156 @@ in
             };
             spec = {
               serviceAccountName = name;
-              initContainers = [{
-                name = "seed-settings";
-                image = if useNixCsi then cfg.baseImage else "busybox:1.36";
-                command = [ "sh" "-c" ];
-                args = [
-                  ''
-                    mkdir -p /home
-                    if [ ! -f /home/settings.json ]; then
-                      cp /defaults/settings.json /home/settings.json
-                      echo "Seeded default settings.json"
-                    fi
-                  ''
-                ];
-                volumeMounts = [
-                  { name = "openhands-home"; mountPath = "/home"; }
-                  { name = "default-settings"; mountPath = "/defaults"; }
-                ];
-              }];
-              containers = [({
-                inherit name;
-                image = containerImage;
-                ports = [{
-                  name = "http";
-                  containerPort = 3000;
-                  protocol = "TCP";
-                }];
-                env = [
-                  { name = "RUNTIME"; value = "kubernetes"; }
-                  { name = "SANDBOX_K8S_NAMESPACE"; value = namespace; }
-                  { name = "SANDBOX_K8S_RESOURCE_REQUESTS"; value = cfg.sandbox.resourceRequests; }
-                  { name = "SANDBOX_K8S_RESOURCE_LIMITS"; value = cfg.sandbox.resourceLimits; }
-                  { name = "SANDBOX_NIX_PACKAGES"; value = cfg.sandbox.nixPackages; }
-                  { name = "SANDBOX_K8S_ENV_SECRET"; value = cfg.sandboxEnvSecretName; }
-                  { name = "OH_APP_CONVERSATION_SANDBOX_STARTUP_TIMEOUT"; value = toString cfg.sandbox.startupTimeout; }
-                  { name = "LLM_MODEL"; value = cfg.llm.model; }
-                  { name = "LLM_API_KEY"; value = "unused"; }
-                  { name = "LLM_AWS_REGION_NAME"; value = cfg.llm.awsRegion; }
-                  { name = "AWS_DEFAULT_REGION"; value = cfg.llm.awsRegion; }
-                  { name = "ENABLE_BROWSER"; value = "false"; }
-                  { name = "SKIP_DEPENDENCY_CHECK"; value = "1"; }
-                  {
-                    name = "GITHUB_TOKEN";
-                    valueFrom.secretKeyRef = {
+              initContainers = lib.mkNumberedList {
+                "0" = {
+                  name = "seed-settings";
+                  image = if useNixCsi then cfg.baseImage else "busybox:1.36";
+                  command = [ "sh" "-c" ];
+                  args = [
+                    ''
+                      mkdir -p /home
+                      if [ ! -f /home/settings.json ]; then
+                        cp /defaults/settings.json /home/settings.json
+                        echo "Seeded default settings.json"
+                      fi
+                    ''
+                  ];
+                  volumeMounts = lib.mkNamedList {
+                    openhands-home.mountPath = "/home";
+                    default-settings.mountPath = "/defaults";
+                  };
+                };
+              };
+              containers = lib.mkNamedList ({
+                ${name} = {
+                  image = containerImage;
+                  ports = lib.mkNamedList {
+                    http = {
+                      containerPort = 3000;
+                      protocol = "TCP";
+                    };
+                  };
+                  env = lib.mkNamedList ({
+                    RUNTIME.value = "kubernetes";
+                    SANDBOX_K8S_NAMESPACE.value = namespace;
+                    SANDBOX_K8S_RESOURCE_REQUESTS.value = cfg.sandbox.resourceRequests;
+                    SANDBOX_K8S_RESOURCE_LIMITS.value = cfg.sandbox.resourceLimits;
+                    SANDBOX_NIX_PACKAGES.value = cfg.sandbox.nixPackages;
+                    SANDBOX_K8S_ENV_SECRET.value = cfg.sandboxEnvSecretName;
+                    OH_APP_CONVERSATION_SANDBOX_STARTUP_TIMEOUT.value = toString cfg.sandbox.startupTimeout;
+                    LLM_MODEL.value = cfg.llm.model;
+                    LLM_API_KEY.value = "unused";
+                    LLM_AWS_REGION_NAME.value = cfg.llm.awsRegion;
+                    AWS_DEFAULT_REGION.value = cfg.llm.awsRegion;
+                    ENABLE_BROWSER.value = "false";
+                    SKIP_DEPENDENCY_CHECK.value = "1";
+                    GITHUB_TOKEN.valueFrom.secretKeyRef = {
                       name = cfg.secretName;
                       key = "github-token";
                       optional = true;
                     };
-                  }
-                ] ++ sandboxImageEnvs;
-                startupProbe = {
-                  httpGet = { path = "/"; port = "http"; };
-                  failureThreshold = if useNixCsi then 60 else 30;
-                  periodSeconds = if useNixCsi then 10 else 5;
-                };
-                livenessProbe = {
-                  httpGet = { path = "/"; port = "http"; };
-                  periodSeconds = 20;
-                };
-                readinessProbe = {
-                  httpGet = { path = "/"; port = "http"; };
-                  periodSeconds = 10;
-                };
-                resources = {
-                  requests = {
-                    cpu = cfg.resources.requests.cpu;
-                    memory = cfg.resources.requests.memory;
+                  } // sandboxImageEnvs);
+                  startupProbe = {
+                    httpGet = { path = "/"; port = "http"; };
+                    failureThreshold = if useNixCsi then 60 else 30;
+                    periodSeconds = if useNixCsi then 10 else 5;
                   };
-                  limits = {
-                    memory = cfg.resources.limits.memory;
+                  livenessProbe = {
+                    httpGet = { path = "/"; port = "http"; };
+                    periodSeconds = 20;
                   };
+                  readinessProbe = {
+                    httpGet = { path = "/"; port = "http"; };
+                    periodSeconds = 10;
+                  };
+                  resources = {
+                    requests = {
+                      cpu = cfg.resources.requests.cpu;
+                      memory = cfg.resources.requests.memory;
+                    };
+                    limits.memory = cfg.resources.limits.memory;
+                  };
+                  volumeMounts = lib.mkNamedList ({
+                    workspace.mountPath = "/opt/workspace_base";
+                    openhands-home.mountPath = "/root/.openhands";
+                  } // lib.optionalAttrs useNixCsi {
+                    nix-env = { mountPath = "/nix"; readOnly = true; };
+                  });
+                } // lib.optionalAttrs (containerCommand != null) {
+                  command = containerCommand;
+                } // lib.optionalAttrs (!useNixCsi) {
+                  imagePullPolicy = cfg.imagePullPolicy;
                 };
-                volumeMounts =
-                  lib.optional useNixCsi nixCsiMount
-                  ++ [
-                    { name = "workspace"; mountPath = "/opt/workspace_base"; }
-                    { name = "openhands-home"; mountPath = "/root/.openhands"; }
-                  ];
-              }
-              // lib.optionalAttrs (containerCommand != null) { command = containerCommand; }
-              // lib.optionalAttrs (!useNixCsi) { imagePullPolicy = cfg.imagePullPolicy; }
-              )];
-              volumes =
-                lib.optional useNixCsi nixCsiVolume
-                ++ [
-                  { name = "workspace"; emptyDir = {}; }
-                  { name = "openhands-home"; emptyDir = {}; }
-                  {
-                    name = "default-settings";
-                    configMap.name = "openhands-default-settings";
-                  }
-                ];
+              });
+              volumes = lib.mkNamedList ({
+                workspace.emptyDir = {};
+                openhands-home.emptyDir = {};
+                default-settings.configMap.name = "openhands-default-settings";
+              } // lib.optionalAttrs useNixCsi {
+                nix-env.csi = {
+                  driver = cfg.csiDriverName;
+                  readOnly = true;
+                  volumeAttributes.flakeRef = cfg.flakeRef;
+                };
+              });
             };
           };
         };
       };
 
       # --- Service ---
-      services.${name} = {
-        metadata = {
-          inherit namespace;
-          labels.app = name;
-        };
+      Service.${name} = {
+        metadata.labels.app = name;
         spec = {
           selector.app = name;
-          ports = [{
-            name = "http";
-            port = 3000;
-            targetPort = "http";
-            protocol = "TCP";
-          }];
+          ports = lib.mkNamedList {
+            http = {
+              port = 3000;
+              targetPort = "http";
+              protocol = "TCP";
+            };
+          };
         };
       };
 
       # --- Ingress (ALB) ---
-      ingresses.${name} = {
-        metadata = {
-          inherit namespace;
-          annotations = {
-            "kubernetes.io/ingress.class" = "alb";
-            "alb.ingress.kubernetes.io/scheme" = "internet-facing";
-            "alb.ingress.kubernetes.io/target-type" = "ip";
-            "alb.ingress.kubernetes.io/listen-ports" = builtins.toJSON [{ HTTPS = 443; }];
-            "alb.ingress.kubernetes.io/certificate-arn" = cfg.certArn;
-            "alb.ingress.kubernetes.io/ssl-redirect" = "443";
-            "alb.ingress.kubernetes.io/healthcheck-path" = "/";
-            "alb.ingress.kubernetes.io/group.name" = "openhands";
-          } // lib.optionalAttrs cfg.cognito.enable {
-            "alb.ingress.kubernetes.io/auth-type" = "cognito";
-            "alb.ingress.kubernetes.io/auth-idp-cognito" = builtins.toJSON {
-              userPoolARN = cfg.cognito.userPoolArn;
-              userPoolClientID = cfg.cognito.userPoolClientId;
-              userPoolDomain = cfg.cognito.userPoolDomain;
-            };
-            "alb.ingress.kubernetes.io/auth-on-unauthenticated-request" = "authenticate";
-            "alb.ingress.kubernetes.io/auth-scope" = "openid email profile";
+      Ingress.${name} = {
+        metadata.annotations = {
+          "kubernetes.io/ingress.class" = "alb";
+          "alb.ingress.kubernetes.io/scheme" = "internet-facing";
+          "alb.ingress.kubernetes.io/target-type" = "ip";
+          "alb.ingress.kubernetes.io/listen-ports" = builtins.toJSON [{ HTTPS = 443; }];
+          "alb.ingress.kubernetes.io/certificate-arn" = cfg.certArn;
+          "alb.ingress.kubernetes.io/ssl-redirect" = "443";
+          "alb.ingress.kubernetes.io/healthcheck-path" = "/";
+          "alb.ingress.kubernetes.io/group.name" = "openhands";
+        } // lib.optionalAttrs cfg.cognito.enable {
+          "alb.ingress.kubernetes.io/auth-type" = "cognito";
+          "alb.ingress.kubernetes.io/auth-idp-cognito" = builtins.toJSON {
+            userPoolARN = cfg.cognito.userPoolArn;
+            userPoolClientID = cfg.cognito.userPoolClientId;
+            userPoolDomain = cfg.cognito.userPoolDomain;
           };
+          "alb.ingress.kubernetes.io/auth-on-unauthenticated-request" = "authenticate";
+          "alb.ingress.kubernetes.io/auth-scope" = "openid email profile";
         };
         spec = {
           ingressClassName = "alb";
-          rules = [{
-            host = cfg.domain;
-            http.paths = [{
-              path = "/";
-              pathType = "Prefix";
-              backend.service = {
-                name = name;
-                port.number = 3000;
-              };
-            }];
-          }];
+          rules = [
+            {
+              host = cfg.domain;
+              http.paths = [
+                {
+                  path = "/";
+                  pathType = "Prefix";
+                  backend.service = {
+                    name = name;
+                    port.number = 3000;
+                  };
+                }
+              ];
+            }
+          ];
         };
       };
     };

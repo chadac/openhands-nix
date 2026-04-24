@@ -1,16 +1,17 @@
-# OpenHands kubenix top-level module
+# OpenHands easykubenix top-level module
 #
-# Composes the server, webhooks, nix-csi, and external-secrets modules
+# Composes the server, webhooks, and external-secrets modules
 # into a single deployable unit. Provides shared options (namespace, etc.).
 #
-{ config, lib, kubenix, ... }:
+# nix-csi is imported directly from the nix-csi repo's native kubenix modules
+# (added in flake.nix via mkOpenhandsManifests).
+#
+{ config, lib, ... }:
 
 {
   imports = [
-    kubenix.modules.k8s
     ./server.nix
     ./webhooks.nix
-    ./nix-csi.nix
     ./external-secrets.nix
   ];
 
@@ -21,4 +22,7 @@
       description = "Kubernetes namespace for all OpenHands resources";
     };
   };
+
+  # Create the openhands namespace
+  config.kubernetes.resources.none.Namespace.${config.openhands.namespace} = {};
 }

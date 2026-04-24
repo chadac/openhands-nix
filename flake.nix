@@ -4,13 +4,17 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
-    kubenix = {
-      url = "github:hall/kubenix";
-      inputs.nixpkgs.follows = "nixpkgs";
+    easykubenix = {
+      url = "github:lillecarl/easykubenix";
+      flake = false;
+    };
+    nix-csi = {
+      url = "github:lillecarl/nix-csi";
+      flake = false;
     };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-parts, kubenix }:
+  outputs = inputs@{ self, nixpkgs, flake-parts, easykubenix, nix-csi }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
@@ -112,19 +116,22 @@
         };
 
       flake = {
-        # Kubenix module for deploying OpenHands on Kubernetes
+        # easykubenix modules for deploying OpenHands on Kubernetes
         kubenixModules.openhands = ./kubernetes;
 
-        # Helper: evaluate kubenix modules with a given configuration
-        lib.mkOpenhandsManifests = { system ? "x86_64-linux", module }:
+        # Helper: render OpenHands K8s manifests using easykubenix
+        lib.mkOpenhandsManifests = { system ? "x86_64-linux", modules ? [] }:
           let
             pkgs = import nixpkgs { inherit system; };
           in
-          kubenix.evalModules.${system} {
+          import easykubenix {
+            inherit pkgs;
             modules = [
+              # nix-csi's native kubenix modules
+              (nix-csi + "/kubenix")
+              # OpenHands modules
               ./kubernetes
-              module
-            ];
+            ] ++ modules;
           };
       };
     };

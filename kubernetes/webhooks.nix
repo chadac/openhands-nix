@@ -1,9 +1,9 @@
-# OpenHands webhooks kubenix module
+# OpenHands webhooks easykubenix module
 #
 # Deploys the openhands-webhooks service that receives GitLab/GitHub/Slack/Jira
 # webhooks and triggers OpenHands conversations.
 #
-{ config, lib, kubenix, ... }:
+{ config, lib, ... }:
 
 let
   cfg = config.openhands.webhooks;
@@ -11,8 +11,6 @@ let
   name = "openhands-webhooks";
 in
 {
-  imports = [ kubenix.modules.k8s ];
-
   options.openhands.webhooks = with lib; {
     enable = mkEnableOption "OpenHands webhooks service";
 
@@ -103,11 +101,10 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    kubernetes.resources = {
+    kubernetes.resources.${namespace} = {
       # --- PVC (optional) ---
-      persistentVolumeClaims = lib.mkIf cfg.persistence.enable {
+      PersistentVolumeClaim = lib.mkIf cfg.persistence.enable {
         "${name}-data" = {
-          metadata.namespace = namespace;
           spec = {
             accessModes = [ "ReadWriteOnce" ];
             resources.requests.storage = cfg.persistence.size;
@@ -118,11 +115,8 @@ in
       };
 
       # --- Deployment ---
-      deployments.${name} = {
-        metadata = {
-          inherit namespace;
-          labels.app = name;
-        };
+      Deployment.${name} = {
+        metadata.labels.app = name;
         spec = {
           replicas = 1;
           strategy.type = "Recreate";
@@ -133,118 +127,111 @@ in
               annotations."karpenter.sh/do-not-disrupt" = "true";
             };
             spec = {
-              containers = [{
-                inherit name;
-                image = "${cfg.image}:${cfg.imageTag}";
-                imagePullPolicy = cfg.imagePullPolicy;
-                ports = [{
-                  name = "http";
-                  containerPort = 8080;
-                  protocol = "TCP";
-                }];
-                env = [
-                  { name = "OPENHANDS_API_URL"; value = cfg.openhandsUrl; }
-                  { name = "OPENHANDS_URL"; value = "https://${config.openhands.server.domain}"; }
-                  { name = "MENTION_PATTERN"; value = cfg.mentionPattern; }
-                  { name = "DEFAULT_GITLAB_REPO"; value = cfg.defaultGitlabRepo; }
-                  { name = "IGNORE_USERNAMES"; value = cfg.ignoreUsernames; }
-                  { name = "GITLAB_ENABLED"; value = cfg.integrations.gitlab; }
-                  { name = "SLACK_ENABLED"; value = cfg.integrations.slack; }
-                  { name = "JIRA_ENABLED"; value = cfg.integrations.jira; }
-                  { name = "CONVERSATION_IDLE_TIMEOUT_MINUTES"; value = cfg.conversationIdleTimeoutMinutes; }
-                  { name = "SANDBOX_K8S_NAMESPACE"; value = namespace; }
-                  {
-                    name = "GITLAB_WEBHOOK_SECRET";
-                    valueFrom.secretKeyRef = { name = cfg.secretName; key = "gitlab-webhook-secret"; optional = true; };
-                  }
-                  {
-                    name = "GITLAB_TOKEN";
-                    valueFrom.secretKeyRef = { name = cfg.secretName; key = "gitlab-token"; optional = true; };
-                  }
-                  {
-                    name = "SLACK_SIGNING_SECRET";
-                    valueFrom.secretKeyRef = { name = cfg.secretName; key = "slack-signing-secret"; optional = true; };
-                  }
-                  {
-                    name = "SLACK_BOT_TOKEN";
-                    valueFrom.secretKeyRef = { name = cfg.secretName; key = "slack-bot-token"; optional = true; };
-                  }
-                  {
-                    name = "RELAY_API_KEY";
-                    valueFrom.secretKeyRef = { name = cfg.secretName; key = "relay-api-key"; };
-                  }
-                ] ++ lib.optional cfg.persistence.enable
-                  { name = "WEBHOOKS_DB_PATH"; value = "/data/webhooks.db"; };
-                livenessProbe = {
-                  httpGet = { path = "/health"; port = "http"; };
-                  periodSeconds = 20;
-                };
-                readinessProbe = {
-                  httpGet = { path = "/health"; port = "http"; };
-                  periodSeconds = 10;
-                };
-                resources = {
-                  requests = {
-                    cpu = cfg.resources.requests.cpu;
-                    memory = cfg.resources.requests.memory;
+              containers = lib.mkNamedList {
+                ${name} = {
+                  image = "${cfg.image}:${cfg.imageTag}";
+                  imagePullPolicy = cfg.imagePullPolicy;
+                  ports = lib.mkNamedList {
+                    http = {
+                      containerPort = 8080;
+                      protocol = "TCP";
+                    };
                   };
-                  limits.memory = cfg.resources.limits.memory;
+                  env = lib.mkNamedList ({
+                    OPENHANDS_API_URL.value = cfg.openhandsUrl;
+                    OPENHANDS_URL.value = "https://${config.openhands.server.domain}";
+                    MENTION_PATTERN.value = cfg.mentionPattern;
+                    DEFAULT_GITLAB_REPO.value = cfg.defaultGitlabRepo;
+                    IGNORE_USERNAMES.value = cfg.ignoreUsernames;
+                    GITLAB_ENABLED.value = cfg.integrations.gitlab;
+                    SLACK_ENABLED.value = cfg.integrations.slack;
+                    JIRA_ENABLED.value = cfg.integrations.jira;
+                    CONVERSATION_IDLE_TIMEOUT_MINUTES.value = cfg.conversationIdleTimeoutMinutes;
+                    SANDBOX_K8S_NAMESPACE.value = namespace;
+                    GITLAB_WEBHOOK_SECRET.valueFrom.secretKeyRef = { name = cfg.secretName; key = "gitlab-webhook-secret"; optional = true; };
+                    GITLAB_TOKEN.valueFrom.secretKeyRef = { name = cfg.secretName; key = "gitlab-token"; optional = true; };
+                    SLACK_SIGNING_SECRET.valueFrom.secretKeyRef = { name = cfg.secretName; key = "slack-signing-secret"; optional = true; };
+                    SLACK_BOT_TOKEN.valueFrom.secretKeyRef = { name = cfg.secretName; key = "slack-bot-token"; optional = true; };
+                    RELAY_API_KEY.valueFrom.secretKeyRef = { name = cfg.secretName; key = "relay-api-key"; };
+                  } // lib.optionalAttrs cfg.persistence.enable {
+                    WEBHOOKS_DB_PATH.value = "/data/webhooks.db";
+                  });
+                  livenessProbe = {
+                    httpGet = { path = "/health"; port = "http"; };
+                    periodSeconds = 20;
+                  };
+                  readinessProbe = {
+                    httpGet = { path = "/health"; port = "http"; };
+                    periodSeconds = 10;
+                  };
+                  resources = {
+                    requests = {
+                      cpu = cfg.resources.requests.cpu;
+                      memory = cfg.resources.requests.memory;
+                    };
+                    limits.memory = cfg.resources.limits.memory;
+                  };
+                  volumeMounts = lib.mkNamedList (
+                    lib.optionalAttrs cfg.persistence.enable {
+                      data.mountPath = "/data";
+                    }
+                  );
                 };
-                volumeMounts = lib.optional cfg.persistence.enable
-                  { name = "data"; mountPath = "/data"; };
-              }];
-              volumes = lib.optional cfg.persistence.enable
-                { name = "data"; persistentVolumeClaim.claimName = "${name}-data"; };
+              };
+              volumes = lib.mkNamedList (
+                lib.optionalAttrs cfg.persistence.enable {
+                  data.persistentVolumeClaim.claimName = "${name}-data";
+                }
+              );
             };
           };
         };
       };
 
       # --- Service ---
-      services.${name} = {
-        metadata = {
-          inherit namespace;
-          labels.app = name;
-        };
+      Service.${name} = {
+        metadata.labels.app = name;
         spec = {
           selector.app = name;
-          ports = [{
-            name = "http";
-            port = 8080;
-            targetPort = "http";
-            protocol = "TCP";
-          }];
+          ports = lib.mkNamedList {
+            http = {
+              port = 8080;
+              targetPort = "http";
+              protocol = "TCP";
+            };
+          };
         };
       };
 
       # --- Ingress (ALB) ---
-      ingresses.${name} = {
-        metadata = {
-          inherit namespace;
-          annotations = {
-            "kubernetes.io/ingress.class" = "alb";
-            "alb.ingress.kubernetes.io/scheme" = "internet-facing";
-            "alb.ingress.kubernetes.io/target-type" = "ip";
-            "alb.ingress.kubernetes.io/listen-ports" = builtins.toJSON [{ HTTPS = 443; }];
-            "alb.ingress.kubernetes.io/certificate-arn" = cfg.certArn;
-            "alb.ingress.kubernetes.io/ssl-redirect" = "443";
-            "alb.ingress.kubernetes.io/healthcheck-path" = "/health";
-            "alb.ingress.kubernetes.io/group.name" = "openhands";
-          };
+      Ingress.${name} = {
+        metadata.annotations = {
+          "kubernetes.io/ingress.class" = "alb";
+          "alb.ingress.kubernetes.io/scheme" = "internet-facing";
+          "alb.ingress.kubernetes.io/target-type" = "ip";
+          "alb.ingress.kubernetes.io/listen-ports" = builtins.toJSON [{ HTTPS = 443; }];
+          "alb.ingress.kubernetes.io/certificate-arn" = cfg.certArn;
+          "alb.ingress.kubernetes.io/ssl-redirect" = "443";
+          "alb.ingress.kubernetes.io/healthcheck-path" = "/health";
+          "alb.ingress.kubernetes.io/group.name" = "openhands";
         };
         spec = {
           ingressClassName = "alb";
-          rules = [{
-            host = cfg.domain;
-            http.paths = [{
-              path = "/";
-              pathType = "Prefix";
-              backend.service = {
-                name = name;
-                port.number = 8080;
-              };
-            }];
-          }];
+          rules = [
+            {
+              host = cfg.domain;
+              http.paths = [
+                {
+                  path = "/";
+                  pathType = "Prefix";
+                  backend.service = {
+                    name = name;
+                    port.number = 8080;
+                  };
+                }
+              ];
+            }
+          ];
         };
       };
     };
