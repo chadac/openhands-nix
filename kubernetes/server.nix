@@ -13,6 +13,29 @@ let
   cfg = config.openhands.server;
   namespace = config.openhands.namespace;
   name = "openhands";
+
+  useNixCsi = cfg.mode == "nix-csi";
+
+  # Container image + command differ by mode
+  containerImage = if useNixCsi then cfg.baseImage else "${cfg.image}:${cfg.imageTag}";
+  containerCommand = if useNixCsi then [ "/nix/var/result/bin/openhands-server-entrypoint" ] else null;
+
+  # Extra volume + mount for nix-csi mode
+  nixCsiVolume = {
+    name = "nix-env";
+    csi = {
+      driver = cfg.csiDriverName;
+      readOnly = true;
+      volumeAttributes.flakeRef = cfg.flakeRef;
+    };
+  };
+  nixCsiMount = { name = "nix-env"; mountPath = "/nix"; readOnly = true; };
+
+  # Sandbox image env vars (only in image mode)
+  sandboxImageEnvs = lib.optionals (!useNixCsi) [
+    { name = "SANDBOX_K8S_IMAGE"; value = "${cfg.sandbox.image}:${cfg.sandbox.imageTag}"; }
+    { name = "SANDBOX_K8S_IMAGE_PULL_POLICY"; value = cfg.imagePullPolicy; }
+  ];
 in
 {
   imports = [ kubenix.modules.k8s ];
@@ -20,18 +43,45 @@ in
   options.openhands.server = with lib; {
     enable = mkEnableOption "OpenHands server";
 
-    # --- nix-csi: flake ref for the server environment ---
-    flakeRef = mkOption {
-      type = types.str;
-      description = "Nix flake reference for the server environment (e.g. github:chadac/openhands-nix#openhands-server)";
+    # --- Delivery mode: "image" (container image) or "nix-csi" (CSI volume) ---
+    mode = mkOption {
+      type = types.enum [ "image" "nix-csi" ];
+      default = "image";
+      description = ''
+        How the server is delivered to the pod:
+        - "image": traditional container image (set image/imageTag)
+        - "nix-csi": nix-csi CSI driver mounts Nix closure (set flakeRef)
+      '';
     };
 
-    # Base image — only needs a shell and basic userland.
-    # nix-csi mounts /nix with the actual server packages.
+    # --- Container image mode ---
+    image = mkOption {
+      type = types.str;
+      default = "";
+      description = "Server container image (used when mode = \"image\")";
+    };
+
+    imageTag = mkOption {
+      type = types.str;
+      default = "latest";
+    };
+
+    imagePullPolicy = mkOption {
+      type = types.str;
+      default = "Always";
+    };
+
+    # --- nix-csi mode ---
+    flakeRef = mkOption {
+      type = types.str;
+      default = "";
+      description = "Nix flake reference for the server environment (used when mode = \"nix-csi\")";
+    };
+
     baseImage = mkOption {
       type = types.str;
       default = "nixos/nix:latest";
-      description = "Minimal base image (provides /bin/sh, coreutils). Server runs from /nix via CSI.";
+      description = "Minimal base image for nix-csi mode (provides /bin/sh, coreutils)";
     };
 
     csiDriverName = mkOption {
@@ -39,6 +89,7 @@ in
       default = "nix.csi.store";
     };
 
+    # --- Common options ---
     replicas = mkOption {
       type = types.int;
       default = 1;
@@ -87,8 +138,15 @@ in
     };
 
     sandbox = {
-      # Sandbox pods also use nix-csi — no image needed.
-      # The server's NixCSIWorkspace handles volume spec generation.
+      image = mkOption {
+        type = types.str;
+        default = "";
+        description = "Agent-server image for sandbox pods (used when mode = \"image\")";
+      };
+      imageTag = mkOption {
+        type = types.str;
+        default = "latest";
+      };
       nixPackages = mkOption {
         type = types.str;
         default = "nixpkgs#awscli2 nixpkgs#kubectl nixpkgs#python312 nixpkgs#nodejs_22 nixpkgs#jq nixpkgs#ripgrep nixpkgs#gh";
@@ -246,7 +304,7 @@ in
               serviceAccountName = name;
               initContainers = [{
                 name = "seed-settings";
-                image = cfg.baseImage;
+                image = if useNixCsi then cfg.baseImage else "busybox:1.36";
                 command = [ "sh" "-c" ];
                 args = [
                   ''
@@ -262,10 +320,9 @@ in
                   { name = "default-settings"; mountPath = "/defaults"; }
                 ];
               }];
-              containers = [{
+              containers = [({
                 inherit name;
-                image = cfg.baseImage;
-                command = [ "/nix/var/result/bin/openhands-server-entrypoint" ];
+                image = containerImage;
                 ports = [{
                   name = "http";
                   containerPort = 3000;
@@ -293,11 +350,11 @@ in
                       optional = true;
                     };
                   }
-                ];
+                ] ++ sandboxImageEnvs;
                 startupProbe = {
                   httpGet = { path = "/"; port = "http"; };
-                  failureThreshold = 60;
-                  periodSeconds = 10;
+                  failureThreshold = if useNixCsi then 60 else 30;
+                  periodSeconds = if useNixCsi then 10 else 5;
                 };
                 livenessProbe = {
                   httpGet = { path = "/"; port = "http"; };
@@ -316,31 +373,26 @@ in
                     memory = cfg.resources.limits.memory;
                   };
                 };
-                volumeMounts = [
-                  { name = "nix-env"; mountPath = "/nix"; readOnly = true; }
-                  { name = "workspace"; mountPath = "/opt/workspace_base"; }
-                  { name = "openhands-home"; mountPath = "/root/.openhands"; }
+                volumeMounts =
+                  lib.optional useNixCsi nixCsiMount
+                  ++ [
+                    { name = "workspace"; mountPath = "/opt/workspace_base"; }
+                    { name = "openhands-home"; mountPath = "/root/.openhands"; }
+                  ];
+              }
+              // lib.optionalAttrs (containerCommand != null) { command = containerCommand; }
+              // lib.optionalAttrs (!useNixCsi) { imagePullPolicy = cfg.imagePullPolicy; }
+              )];
+              volumes =
+                lib.optional useNixCsi nixCsiVolume
+                ++ [
+                  { name = "workspace"; emptyDir = {}; }
+                  { name = "openhands-home"; emptyDir = {}; }
+                  {
+                    name = "default-settings";
+                    configMap.name = "openhands-default-settings";
+                  }
                 ];
-              }];
-              volumes = [
-                # nix-csi ephemeral volume — builds/fetches the server flake on the node
-                {
-                  name = "nix-env";
-                  csi = {
-                    driver = cfg.csiDriverName;
-                    readOnly = true;
-                    volumeAttributes = {
-                      flakeRef = cfg.flakeRef;
-                    };
-                  };
-                }
-                { name = "workspace"; emptyDir = {}; }
-                { name = "openhands-home"; emptyDir = {}; }
-                {
-                  name = "default-settings";
-                  configMap.name = "openhands-default-settings";
-                }
-              ];
             };
           };
         };
