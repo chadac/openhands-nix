@@ -14,13 +14,19 @@
 
 let
   cfg = config.openhands.nixCsi;
-  namespace = config.openhands.namespace;
+  namespace = cfg.namespace;
 in
 {
   imports = [ kubenix.modules.k8s ];
 
   options.openhands.nixCsi = with lib; {
     enable = mkEnableOption "nix-csi CSI driver";
+
+    namespace = mkOption {
+      type = types.str;
+      default = "nix-csi";
+      description = "Namespace for the nix-csi DaemonSet and supporting resources";
+    };
 
     image = mkOption {
       type = types.str;
@@ -105,6 +111,9 @@ in
 
   config = lib.mkIf cfg.enable {
     kubernetes.resources = {
+      # --- Namespace ---
+      namespaces.${namespace} = {};
+
       # --- CSIDriver ---
       cSIDrivers.${cfg.csiDriverName} = {
         spec = {
