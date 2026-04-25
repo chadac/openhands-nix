@@ -347,7 +347,7 @@ in
                     workspace.mountPath = "/opt/workspace_base";
                     openhands-home.mountPath = "/root/.openhands";
                   } // lib.optionalAttrs useNixCsi {
-                    nix-env = { mountPath = "/nix"; readOnly = true; };
+                    nix-env = { mountPath = "/nix"; subPath = "nix"; readOnly = true; };
                   });
                 } // lib.optionalAttrs (containerCommand != null) {
                   command = containerCommand;
