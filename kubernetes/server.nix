@@ -18,7 +18,13 @@ let
 
   # Container image + command differ by mode
   containerImage = if useNixCsi then cfg.baseImage else "${cfg.image}:${cfg.imageTag}";
-  containerCommand = if useNixCsi then [ "/nix/var/result/bin/openhands-server-entrypoint" ] else null;
+  # In nix-csi mode, the CSI volume is mounted at /nix-csi.  We symlink
+  # /nix/store and /nix/var into it so that absolute Nix store paths
+  # (shebangs, rpath, etc.) resolve correctly.
+  containerCommand = if useNixCsi then [
+    "sh" "-c"
+    "mkdir -p /nix && ln -sfn /nix-csi/nix/store /nix/store && ln -sfn /nix-csi/nix/var /nix/var && exec /nix/var/result/bin/openhands-server-entrypoint"
+  ] else null;
 
   # Sandbox image env vars (only in image mode)
   sandboxImageEnvs = lib.optionalAttrs (!useNixCsi) {
@@ -67,8 +73,8 @@ in
 
     baseImage = mkOption {
       type = types.str;
-      default = "ghcr.io/lillecarl/nix-csi/scratch:1.0.1";
-      description = "Minimal base image for nix-csi mode (sets PATH to /nix/var/result/bin)";
+      default = "busybox:latest";
+      description = "Minimal base image for nix-csi mode (needs sh for symlink setup)";
     };
 
     csiDriverName = mkOption {
@@ -347,7 +353,7 @@ in
                     workspace.mountPath = "/opt/workspace_base";
                     openhands-home.mountPath = "/root/.openhands";
                   } // lib.optionalAttrs useNixCsi {
-                    nix-env = { mountPath = "/nix"; subPath = "nix"; readOnly = true; };
+                    nix-env = { mountPath = "/nix-csi"; readOnly = true; };
                   });
                 } // lib.optionalAttrs (containerCommand != null) {
                   command = containerCommand;
