@@ -31,6 +31,15 @@ let
     SANDBOX_K8S_IMAGE.value = "${cfg.sandbox.image}:${cfg.sandbox.imageTag}";
     SANDBOX_K8S_IMAGE_PULL_POLICY.value = cfg.imagePullPolicy;
   };
+
+  # Sandbox Ingress env vars (for per-sandbox ALB routing)
+  sandboxIngressEnvs = lib.optionalAttrs (cfg.sandbox.externalHost != "") {
+    SANDBOX_K8S_EXTERNAL_HOST.value = cfg.sandbox.externalHost;
+  } // lib.optionalAttrs (cfg.sandbox.ingressGroup != "") {
+    SANDBOX_K8S_INGRESS_GROUP.value = cfg.sandbox.ingressGroup;
+  } // lib.optionalAttrs (cfg.sandbox.ingressClass != "alb-external") {
+    SANDBOX_K8S_INGRESS_CLASS.value = cfg.sandbox.ingressClass;
+  };
 in
 {
   options.openhands.server = with lib; {
@@ -156,6 +165,21 @@ in
       startupTimeout = mkOption {
         type = types.int;
         default = 600;
+      };
+      externalHost = mkOption {
+        type = types.str;
+        default = "";
+        description = "External hostname for sandbox Ingress routes (enables per-sandbox Ingress creation)";
+      };
+      ingressGroup = mkOption {
+        type = types.str;
+        default = "";
+        description = "ALB Ingress group name for sandbox Ingresses (must match the main server Ingress group)";
+      };
+      ingressClass = mkOption {
+        type = types.str;
+        default = "alb";
+        description = "Ingress class for sandbox Ingresses";
       };
     };
 
@@ -328,7 +352,7 @@ in
                       key = "github-token";
                       optional = true;
                     };
-                  } // sandboxImageEnvs);
+                  } // sandboxImageEnvs // sandboxIngressEnvs);
                   startupProbe = {
                     httpGet = { path = "/"; port = "http"; };
                     failureThreshold = if useNixCsi then 60 else 30;
