@@ -92,7 +92,7 @@
             };
 
             # OpenHands server (web UI + API)
-            openhands-server = serverPackages.backend;
+            openhands-server = serverImages.entrypoint;
             openhands-frontend = serverPackages.frontend;
 
             # Server container image: nix build .#server-image

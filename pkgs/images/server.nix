@@ -106,6 +106,9 @@ let
   };
 
 in {
+  # Standalone server environment for nix-csi mode
+  inherit entrypoint;
+
   mkServerImage = {
     name ? "openhands-server",
     tag ? "latest",
