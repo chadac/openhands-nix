@@ -1,6 +1,6 @@
 { lib, pythonPackages, openhands-common }:
 
-pythonPackages.buildPythonApplication {
+pythonPackages.buildPythonPackage {
   pname = "openhands-webhooks";
   version = "0.1.0";
   pyproject = true;
@@ -14,6 +14,8 @@ pythonPackages.buildPythonApplication {
     pythonPackages.fastapi
     pythonPackages.uvicorn
     pythonPackages.httpx
+    pythonPackages.pyjwt
+    pythonPackages.cryptography
   ];
 
   doCheck = false;

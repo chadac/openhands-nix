@@ -1,6 +1,6 @@
 { lib, pythonPackages, openhands-common }:
 
-pythonPackages.buildPythonApplication {
+pythonPackages.buildPythonPackage {
   pname = "openhands-lifecycle";
   version = "0.1.0";
   pyproject = true;

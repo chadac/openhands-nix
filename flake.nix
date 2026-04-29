@@ -83,6 +83,11 @@
             inherit pkgs lib pythonPackages sdkPackages serverPackages skillsDir n2c;
           };
 
+          # Microservice container images
+          serviceImages = import ./pkgs/images/service.nix {
+            inherit pkgs lib pythonPackages openhands-common openhands-webhooks openhands-lifecycle openhands-broker n2c;
+          };
+
           # Segmented test derivations
           sdkTests = import ./pkgs/sdk/tests.nix {
             inherit lib pythonPackages sdkPackages;
@@ -116,6 +121,9 @@
 
             # OpenHands microservices
             inherit openhands-common openhands-webhooks openhands-lifecycle openhands-broker;
+
+            # Microservice container images
+            inherit (serviceImages) webhooks-image lifecycle-image broker-image;
           };
 
           # checks = packages (import checks) + segmented test suite

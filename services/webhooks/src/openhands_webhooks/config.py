@@ -31,8 +31,13 @@ class WebhooksSettings(BaseSettings):
 
     # Tokens for posting responses back to services
     gitlab_token: str = ""
-    github_token: str = ""
+    github_token: str = ""  # PAT fallback (used if github_app_id is empty)
     slack_bot_token: str = ""
+
+    # GitHub App authentication
+    github_app_id: str = ""
+    github_app_private_key: str = ""  # PEM content or path to .pem file
+    github_client_id: str = ""  # Client ID for installation lookup
 
     # Atlassian OAuth 2.0 client credentials
     atlassian_client_id: str = ""
