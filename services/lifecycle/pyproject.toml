@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openhands-lifecycle"
+version = "0.1.0"
+description = "Lifecycle manager for OpenHands sandbox resources"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "openhands-common>=0.1.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+    "kubernetes>=32.0",
+]
+
+[project.scripts]
+openhands-lifecycle = "openhands_lifecycle.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

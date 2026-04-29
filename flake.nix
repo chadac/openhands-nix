@@ -4,23 +4,21 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
-    easykubenix = {
-      url = "github:lillecarl/easykubenix";
-      flake = false;
-    };
-    nix-csi = {
-      url = "github:lillecarl/nix-csi";
-      flake = false;
+    nix2container = {
+      url = "github:nlewo/nix2container";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-parts, easykubenix, nix-csi }:
+  outputs = inputs@{ self, nixpkgs, flake-parts, nix2container }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
       perSystem = { pkgs, system, lib, ... }:
         let
           python = pkgs.python312;
+
+          n2c = nix2container.packages.${system}.nix2container;
 
           # Apply our Python overlay for missing/bumped deps
           pythonPackages = python.pkgs.overrideScope (
@@ -54,17 +52,35 @@
             inherit (pkgs) nodejs;
           };
 
+          # Shared library for OpenHands services
+          openhands-common = pkgs.callPackage ./services/common {
+            inherit pythonPackages;
+          };
+
+          # OpenHands microservices
+          openhands-webhooks = pkgs.callPackage ./services/webhooks {
+            inherit pythonPackages openhands-common;
+          };
+
+          openhands-lifecycle = pkgs.callPackage ./services/lifecycle {
+            inherit pythonPackages openhands-common;
+          };
+
+          openhands-broker = pkgs.callPackage ./services/broker {
+            inherit pythonPackages openhands-common;
+          };
+
           # Nix-specific agent skills
           skillsDir = ./skills;
 
           # Agent-server container image builder
           agentServerImages = import ./pkgs/images/agent-server.nix {
-            inherit pkgs lib pythonPackages sdkPackages skillsDir;
+            inherit pkgs lib pythonPackages sdkPackages serverPackages skillsDir n2c;
           };
 
           # Full server image (UI + API)
           serverImages = import ./pkgs/images/server.nix {
-            inherit pkgs lib pythonPackages sdkPackages serverPackages skillsDir;
+            inherit pkgs lib pythonPackages sdkPackages serverPackages skillsDir n2c;
           };
 
           # Segmented test derivations
@@ -97,10 +113,10 @@
 
             # Server container image: nix build .#server-image
             server-image = serverImages.mkServerImage { };
-          };
 
-          # The image builder is exposed via packages.agent-server-image
-          # and can be customized by importing pkgs/images/agent-server.nix directly.
+            # OpenHands microservices
+            inherit openhands-common openhands-webhooks openhands-lifecycle openhands-broker;
+          };
 
           # checks = packages (import checks) + segmented test suite
           checks = {
@@ -112,27 +128,13 @@
               openhands-workspace;
             openhands-server = serverPackages.backend;
             openhands-frontend = serverPackages.frontend;
+            inherit openhands-common openhands-webhooks openhands-lifecycle openhands-broker;
           } // sdkTests;
         };
 
       flake = {
-        # easykubenix modules for deploying OpenHands on Kubernetes
+        # kubenix modules for deploying OpenHands on Kubernetes
         kubenixModules.openhands = ./kubernetes;
-
-        # Helper: render OpenHands K8s manifests using easykubenix
-        lib.mkOpenhandsManifests = { system ? "x86_64-linux", modules ? [] }:
-          let
-            pkgs = import nixpkgs { inherit system; };
-          in
-          import easykubenix {
-            inherit pkgs;
-            modules = [
-              # nix-csi's native kubenix modules
-              (nix-csi + "/kubenix")
-              # OpenHands modules
-              ./kubernetes
-            ] ++ modules;
-          };
       };
     };
 }

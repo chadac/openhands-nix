@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openhands-webhooks"
+version = "0.1.0"
+description = "Inbound webhook handler for OpenHands conversations"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "openhands-common>=0.1.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+]
+
+[project.scripts]
+openhands-webhooks = "openhands_webhooks.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openhands-broker"
+version = "0.1.0"
+description = "Credential-injecting transparent proxy for OpenHands agents"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "openhands-common>=0.1.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "httpx>=0.28",
+    "kubernetes>=32.0",
+]
+
+[project.scripts]
+openhands-broker = "openhands_broker.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

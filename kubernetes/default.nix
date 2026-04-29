@@ -12,6 +12,8 @@
   imports = [
     ./server.nix
     ./webhooks.nix
+    ./lifecycle.nix
+    ./broker.nix
     ./external-secrets.nix
   ];
 
