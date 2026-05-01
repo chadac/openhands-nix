@@ -25,6 +25,7 @@ pythonPackages.buildPythonPackage {
     "openhands_lifecycle.config"
     "openhands_lifecycle.cleanup"
     "openhands_lifecycle.k8s"
+    "openhands_lifecycle.resume"
   ];
 
   meta = {

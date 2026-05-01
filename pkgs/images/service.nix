@@ -16,6 +16,7 @@ let
     port ? 8080,
     tag ? "latest",
     entrypointModule,
+    extraPackages ? [],
   }:
   let
     servicePython = pythonPackages.python.withPackages (ps: [
@@ -23,7 +24,7 @@ let
       ps.uvicorn
     ]);
 
-    systemPackages = with pkgs; [ coreutils bash cacert ];
+    systemPackages = with pkgs; [ coreutils bash cacert ] ++ extraPackages;
 
     rootfs = pkgs.runCommand "${name}-rootfs" {} ''
       mkdir -p $out/tmp $out/etc

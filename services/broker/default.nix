@@ -15,6 +15,8 @@ pythonPackages.buildPythonPackage {
     pythonPackages.uvicorn
     pythonPackages.httpx
     pythonPackages.kubernetes
+    pythonPackages.pyjwt
+    pythonPackages.cryptography
   ];
 
   doCheck = false;
@@ -25,6 +27,7 @@ pythonPackages.buildPythonPackage {
     "openhands_broker.config"
     "openhands_broker.auth"
     "openhands_broker.proxy"
+    "openhands_broker.github_app"
   ];
 
   meta = {

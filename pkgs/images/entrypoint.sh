@@ -86,20 +86,54 @@ setup_lazy_vscode() {
     fi
 }
 
+# --- Pre-warm Chromium ---
+# browser-use's init timeout is 30s. The lazy-chromium wrapper downloads
+# Chromium from the Nix binary cache on first use (~200MB), which can take
+# longer than 30s. Pre-warm it in the background so it's ready when needed.
+warm_chromium_background() {
+    local chromium_bin
+    chromium_bin="$(command -v chromium 2>/dev/null || true)"
+    if [ -z "$chromium_bin" ]; then
+        return 0
+    fi
+
+    (
+        echo "[entrypoint] Pre-warming Chromium in background..."
+        if "$chromium_bin" --version >/dev/null 2>&1; then
+            echo "[entrypoint] Chromium pre-warmed successfully"
+        else
+            echo "[entrypoint] WARNING: Chromium pre-warm failed"
+        fi
+    ) &
+}
+
 # --- Main ---
 
 # Set up writable Nix store if needed (must be synchronous — overlay mount
-# needs to happen before the server or nix profile install runs)
-if [ -n "${NIX_PACKAGES:-}" ]; then
+# needs to happen before the server, nix profile install, or chromium runs).
+# Also needed for lazy-chromium download even without NIX_PACKAGES.
+if [ -n "${NIX_PACKAGES:-}" ] || command -v chromium >/dev/null 2>&1; then
     setup_overlay_store || true
+fi
+
+if [ -n "${NIX_PACKAGES:-}" ]; then
     install_packages_background
 fi
 
 # Set up lazy VS Code wrapper before server starts
 setup_lazy_vscode
 
+# Pre-warm Chromium for browser-use (background, non-blocking)
+warm_chromium_background
+
 # Ensure nix profile bin is on PATH for the server process
 export PATH="$HOME/.nix-profile/bin:$PATH"
+
+# Configure git credential helper for broker-based GitHub auth
+if [ -n "${BROKER_URL:-}" ]; then
+    git config --global credential.helper broker
+    echo "[entrypoint] Git credential helper configured (broker: $BROKER_URL)"
+fi
 
 echo "[entrypoint] Starting agent-server on ${HOST}:${PORT}"
 exec python -m openhands.agent_server --host "$HOST" --port "$PORT" "$@"

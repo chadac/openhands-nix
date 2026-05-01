@@ -11,6 +11,7 @@ from openhands_common import db, messaging
 
 from .cleanup import cleanup_idle_conversations, cleanup_orphaned_sandboxes, cleanup_old_pvcs
 from .config import db_settings, mq_settings, settings
+from .resume import handle_conversation_message
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +52,11 @@ async def lifespan(app: FastAPI):
     global _cleanup_task
     await db.init_db(db_settings)
     await messaging.connect(mq_settings)
+    await messaging.subscribe(
+        "lifecycle.conversation-messages",
+        ["conversation.message"],
+        handle_conversation_message,
+    )
     _cleanup_task = asyncio.create_task(_cleanup_loop())
     logger.info("Lifecycle manager started")
     yield

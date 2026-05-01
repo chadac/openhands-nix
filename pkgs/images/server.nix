@@ -1,14 +1,17 @@
 # Build an OCI container image for the full OpenHands server (UI + API).
 #
-# Combines the Python backend (openhands-ai) with the React frontend
-# static assets. Runs uvicorn on port 3000 serving both API and SPA.
+# Uses nix2container for content-addressed layer dedup across images.
+# Each nix store path becomes a separate OCI layer, so shared deps
+# (Python, coreutils, nix, etc.) are only pushed/pulled once.
 #
 # Usage:
 #   nix build .#server-image
-#   docker load < result
-#   docker run -p 3000:3000 -e RUNTIME=process openhands-server:latest
+#   # Push directly to registry (no docker daemon needed):
+#   nix run .#server-image.copyToRegistry
+#   # Or load into docker:
+#   nix run .#server-image.copyToDockerDaemon
 #
-{ pkgs, lib, pythonPackages, sdkPackages, serverPackages, skillsDir }:
+{ pkgs, lib, pythonPackages, sdkPackages, serverPackages, skillsDir, n2c }:
 
 let
   # Python environment with the full server + SDK
@@ -26,9 +29,29 @@ let
   systemPackages = with pkgs; [
     coreutils bash git gnused gnugrep findutils gawk
     gnutar gzip xz which tmux procps util-linux
-    # Nix CLI for the nix runtime (nix shell, nix develop, etc.)
     nix
   ];
+
+  allPackages = systemPackages ++ [ serverPython pkgs.cacert ];
+
+  # Root filesystem overlay — replaces fakeRootCommands
+  rootfs = pkgs.runCommand "openhands-server-rootfs" {} ''
+    mkdir -p $out/app $out/workspace/project $out/tmp $out/root $out/etc $out/etc/nix
+    chmod 1777 $out/tmp
+
+    echo "root:x:0:0:root:/root:/bin/bash" > $out/etc/passwd
+    echo "root:x:0:" > $out/etc/group
+
+    # Nix configuration
+    cat > $out/etc/nix/nix.conf <<'NIX_CONF'
+    experimental-features = nix-command flakes
+    sandbox = false
+    NIX_CONF
+
+    # Nix-specific skills for the agent
+    mkdir -p $out/root/.openhands/skills
+    cp ${skillsDir}/*.md $out/root/.openhands/skills/
+  '';
 
   entrypoint = pkgs.writeShellApplication {
     name = "openhands-server-entrypoint";
@@ -38,24 +61,20 @@ let
       HOST="''${HOST:-0.0.0.0}"
 
       # Set up the frontend build directory where the server expects it.
-      # The server mounts SPA static files from ./frontend/build/ (relative to CWD).
       mkdir -p /app/frontend
       ln -sfn ${frontend} /app/frontend/build
 
       cd /app
 
       # Seed default settings via API after server starts (skips UI setup wizard).
-      # Settings are stored in SQLite, so we POST them once the server is ready.
       if [ "''${SEED_SETTINGS:-true}" = "true" ]; then
         (
-          # Wait for server to accept connections
           for _ in $(seq 1 60); do
             if python -c "import urllib.request; urllib.request.urlopen('http://localhost:''${PORT}/api/options/models')" 2>/dev/null; then
               break
             fi
             sleep 1
           done
-          # Only seed if no settings exist yet
           EXISTING=$(python -c "
       import urllib.request, json
       try:
@@ -105,8 +124,20 @@ let
     '';
   };
 
+  # Symlink bin paths into /bin for container PATH
+  rootBinEnv = pkgs.buildEnv {
+    name = "server-root-env";
+    paths = allPackages ++ [ entrypoint ];
+    pathsToLink = [ "/bin" "/etc/ssl" "/share" ];
+  };
+
+  # System packages layer — changes rarely (only when adding/updating system tools).
+  # This is a large layer (~200MB) that stays cached across most pushes.
+  systemLayer = n2c.buildLayer {
+    deps = systemPackages ++ [ pkgs.cacert pkgs.nix ];
+  };
+
 in {
-  # Standalone server environment for nix-csi mode
   inherit entrypoint;
 
   mkServerImage = {
@@ -114,32 +145,13 @@ in {
     tag ? "latest",
     port ? 3000,
   }:
-  pkgs.dockerTools.buildLayeredImage {
+  n2c.buildImage {
     inherit name tag;
+    initializeNixDatabase = true;
+    maxLayers = 80;
 
-    contents = systemPackages ++ [
-      serverPython
-      pkgs.cacert
-      entrypoint
-    ];
-
-    fakeRootCommands = ''
-      mkdir -p ./app ./workspace ./workspace/project ./tmp ./root ./etc ./etc/nix
-      chmod 1777 ./tmp
-
-      echo "root:x:0:0:root:/root:/bin/bash" > ./etc/passwd
-      echo "root:x:0:" > ./etc/group
-
-      # Nix configuration for the container
-      cat > ./etc/nix/nix.conf <<'NIX_CONF'
-      experimental-features = nix-command flakes
-      sandbox = false
-      NIX_CONF
-
-      # Nix-specific skills for the agent
-      mkdir -p ./root/.openhands/skills
-      cp ${skillsDir}/*.md ./root/.openhands/skills/
-    '';
+    layers = [ systemLayer ];
+    copyToRoot = [ rootfs rootBinEnv ];
 
     config = {
       Entrypoint = [ "${entrypoint}/bin/openhands-server-entrypoint" ];
@@ -149,15 +161,13 @@ in {
       WorkingDir = "/app";
       Env = [
         "HOME=/root"
-        "PATH=${lib.makeBinPath (systemPackages ++ [ serverPython pkgs.cacert entrypoint ])}:/usr/bin:/bin"
+        "PATH=${lib.makeBinPath (allPackages ++ [ entrypoint ])}:/usr/bin:/bin"
         "PORT=${toString port}"
         "HOST=0.0.0.0"
         "PYTHONDONTWRITEBYTECODE=1"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-        # Default to local runtime (no docker-in-docker needed)
         "RUNTIME=local"
-        # Disable browser automation (no Playwright binaries in this image)
         "ENABLE_BROWSER=false"
         "SKIP_DEPENDENCY_CHECK=1"
       ];

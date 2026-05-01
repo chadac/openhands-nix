@@ -232,6 +232,12 @@ from openhands.runtime.impl.nix.nix_runtime import NixRuntime" \
           "os.getenv('RUNTIME') in ('local', 'process')" \
           "os.getenv('RUNTIME') in ('local', 'process', 'nix')"
 
+      # Remove JupyterRequirement from CodeActAgent (jupyter-kernel-gateway not packaged).
+      substituteInPlace $SITE/openhands/agenthub/codeact_agent/codeact_agent.py \
+        --replace-fail \
+          "        JupyterRequirement()," \
+          "        # JupyterRequirement(),  # removed: jupyter-kernel-gateway not packaged"
+
       # Remove browsing agents from agenthub imports (browsergym not packaged).
       substituteInPlace $SITE/openhands/agenthub/__init__.py \
         --replace-fail \
@@ -271,6 +277,26 @@ PYEOF
         --replace-fail \
           "                tools.append(BrowserTool)" \
           "                if BrowserTool is not None: tools.append(BrowserTool)"
+
+      # Stub out runtime/browser module (browsergym not packaged).
+      # The action_execution_server imports this at module level, so we need
+      # a no-op browse() function that the server can call without browsergym.
+      cat > $SITE/openhands/runtime/browser/__init__.py <<'PYEOF'
+"""Browser module stub — browsergym is not packaged."""
+def browse(*args, **kwargs):
+    raise NotImplementedError("Browser support requires browsergym (not installed)")
+PYEOF
+      cat > $SITE/openhands/runtime/browser/utils.py <<'PYEOF'
+"""Browser utils stub — browsergym is not packaged."""
+def flatten_axtree_to_str(*args, **kwargs):
+    return ""
+PYEOF
+      cat > $SITE/openhands/runtime/browser/browser_env.py <<'PYEOF'
+"""Browser env stub — browsergym is not packaged."""
+class BrowserEnv:
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError("Browser support requires browsergym (not installed)")
+PYEOF
 
       # Install the openhands_nix extension package (Kubernetes sandbox service)
       mkdir -p $SITE/openhands_nix
@@ -351,6 +377,32 @@ PYEOF
             agent_server_url = next(exposed_url.url for exposed_url in exposed_urls if exposed_url.name == AGENT_SERVER)
         agent_server_url = replace_localhost_hostname_for_docker(agent_server_url)
         return agent_server_url'
+
+      # Recover orphaned start tasks on server startup.
+      # When the server restarts, any in-flight start tasks (WAITING_FOR_SANDBOX,
+      # etc.) have lost their background asyncio.Task and will never complete.
+      # Mark them as ERROR so the UI shows an actionable state.
+      cp ${./startup_recovery.py} $SITE/openhands_nix/startup_recovery.py
+      substituteInPlace $SITE/openhands/app_server/app_lifespan/oss_app_lifespan_service.py \
+        --replace-fail \
+          'async def __aenter__(self):
+        if self.run_alembic_on_startup:
+            self.run_alembic()
+        return self' \
+          'async def __aenter__(self):
+        if self.run_alembic_on_startup:
+            self.run_alembic()
+        # Recover orphaned start tasks from previous server incarnation
+        import os as _os
+        if _os.getenv("RUNTIME") == "kubernetes":
+            try:
+                from openhands_nix.startup_recovery import recover_orphaned_start_tasks
+                import asyncio, logging
+                _logger = logging.getLogger("openhands_nix.startup_recovery")
+                await recover_orphaned_start_tasks(_logger)
+            except Exception:
+                import traceback; traceback.print_exc()
+        return self'
 
       # Recreate missing sandboxes when a user opens a conversation.
       # The get_conversation endpoint is user-initiated (not polling), so

@@ -180,37 +180,39 @@ def sandbox(
     conversation_id = conv["conversation_id"]
     logger.info("Created conversation %s", conversation_id)
 
-    sandbox_id: str | None = None
+    # The upstream KubernetesRuntime uses conversation_id as the sandbox identifier.
+    # It creates pods named openhands-runtime-<conversation_id> with label session=<conversation_id>.
+    sandbox_id = conversation_id
     try:
         # 2. Wait for sandbox pod to be Running + Ready
         deadline = time.monotonic() + STARTUP_TIMEOUT
         while time.monotonic() < deadline:
             conv_info = server.get_conversation(conversation_id)
-            sandbox_id = conv_info.get("sandbox_id") or (
-                conv_info.get("sandbox", {}).get("id") if isinstance(conv_info.get("sandbox"), dict) else None
-            )
-            if sandbox_id:
-                try:
-                    pods = core_v1.list_namespaced_pod(
-                        namespace=NAMESPACE,
-                        label_selector=f"openhands.ai/sandbox-id={sandbox_id}",
-                        limit=1,
-                    )
-                    if pods.items:
-                        pod = pods.items[0]
-                        phase = pod.status.phase if pod.status else None
-                        if phase == "Running" and all(
-                            cs.ready for cs in (pod.status.container_statuses or [])
-                        ):
-                            logger.info("Sandbox %s is Running", sandbox_id)
-                            break
-                except Exception as e:
-                    logger.debug("Error checking pod: %s", e)
+            status = conv_info.get("status", "")
+
+            # Check pod readiness directly using the upstream naming convention
+            try:
+                pods = core_v1.list_namespaced_pod(
+                    namespace=NAMESPACE,
+                    label_selector=f"app=openhands-runtime,session={conversation_id}",
+                    limit=1,
+                )
+                if pods.items:
+                    pod = pods.items[0]
+                    phase = pod.status.phase if pod.status else None
+                    if phase == "Running" and all(
+                        cs.ready for cs in (pod.status.container_statuses or [])
+                    ):
+                        logger.info("Sandbox %s is Running (pod: %s)", sandbox_id, pod.metadata.name)
+                        break
+            except Exception as e:
+                logger.debug("Error checking pod: %s", e)
+
             time.sleep(3)
         else:
             pytest.fail(
                 f"Sandbox did not reach Running within {STARTUP_TIMEOUT}s "
-                f"(conversation={conversation_id}, sandbox={sandbox_id})"
+                f"(conversation={conversation_id})"
             )
 
         yield SandboxFixture(conversation_id=conversation_id, sandbox_id=sandbox_id)
@@ -228,7 +230,7 @@ def sandbox(
 @pytest.fixture()
 def sandbox_client(sandbox: SandboxFixture) -> Generator[httpx.Client, None, None]:
     """Port-forward to the sandbox agent-server and yield an HTTP client."""
-    svc = f"svc/oh-sandbox-{sandbox.sandbox_id}"
-    with port_forward(NAMESPACE, svc, 8000) as local_port:
+    svc = f"svc/openhands-runtime-{sandbox.sandbox_id}-svc"
+    with port_forward(NAMESPACE, svc, 8080) as local_port:
         with httpx.Client(base_url=f"http://127.0.0.1:{local_port}", timeout=30) as http:
             yield http

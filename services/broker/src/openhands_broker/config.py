@@ -15,9 +15,14 @@ class BrokerSettings(BaseSettings):
     slack_api_url: str = "https://slack.com/api"
 
     # Global credentials (injected into proxied requests)
-    github_token: str = ""
+    github_token: str = ""  # PAT fallback (used if github_app_id is empty)
     gitlab_token: str = ""
     slack_bot_token: str = ""
+
+    # GitHub App authentication (preferred over PAT)
+    github_app_id: str = ""
+    github_app_private_key: str = ""  # PEM content or path to .pem file
+    github_app_installation_id: int = 0  # Default installation ID
 
     # Atlassian OAuth 2.0
     atlassian_client_id: str = ""

@@ -146,9 +146,22 @@ let
         -e 's/^from browser_use.filesystem/# &/' \
         browser_use/mcp/server.py
 
-      # Stub out the telemetry init (self._telemetry = ProductTelemetry())
+      # Stub out runtime references to stripped imports:
+      # - ProductTelemetry (stripped posthog dep)
+      # - Tools() (imports agent.views → openai)
+      # - FileSystem() (stripped filesystem module)
+      # - ChatOpenAI block (stripped openai dep — OpenHands has its own LLM layer)
       sed -i \
         -e 's/self._telemetry = ProductTelemetry()/self._telemetry = None/' \
+        -e 's/self.tools = Tools()/self.tools = None  # Tools stripped (imports openai via agent.views)/' \
+        -e 's/self.file_system = FileSystem(base_dir=Path(file_system_path).expanduser())/self.file_system = None  # FileSystem stripped/' \
+        browser_use/mcp/server.py
+
+      # Neutralize the ChatOpenAI init block: guard with `if False:` so the
+      # body (which references ChatOpenAI) is never executed but remains
+      # syntactically valid Python.
+      sed -i \
+        -e "s/if api_key := llm_config.get('api_key'):/if False:  # ChatOpenAI stripped (OpenHands uses its own LLM)/" \
         browser_use/mcp/server.py
 
       # The MCP SDK import block has sys.exit(1) on failure. When browser_use

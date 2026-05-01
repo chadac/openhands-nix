@@ -16,6 +16,7 @@ from openhands_common import db
 
 from .auth import verify_sandbox_token, resolve_conversation_id
 from .config import db_settings, settings
+from .github_app import get_installation_token, is_app_configured
 from .proxy import proxy_request
 from .providers.github import GitHubInjector
 from .providers.gitlab import GitLabInjector
@@ -115,6 +116,35 @@ async def proxy_slack(
     conv_id = await resolve_conversation_id(sandbox_id)
     return await proxy_request(
         request, settings.slack_api_url, path, _slack, conv_id,
+    )
+
+
+@app.get("/git-credentials")
+async def git_credentials(
+    sandbox_id: str = Depends(verify_sandbox_token),
+) -> Response:
+    """Return a fresh GitHub installation token for git credential helpers.
+
+    The sandbox's git credential helper calls this endpoint to get a token
+    for HTTPS git operations. Returns the username and password in a format
+    the credential helper script can parse.
+    """
+    if not is_app_configured() or not settings.github_app_installation_id:
+        return Response(content="GitHub App not configured", status_code=503)
+
+    token = await get_installation_token(settings.github_app_installation_id)
+    if not token:
+        return Response(content="Failed to generate installation token", status_code=502)
+
+    import json
+    return Response(
+        content=json.dumps({
+            "protocol": "https",
+            "host": "github.com",
+            "username": "x-access-token",
+            "password": token,
+        }),
+        media_type="application/json",
     )
 
 

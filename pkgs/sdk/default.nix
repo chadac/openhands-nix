@@ -80,13 +80,8 @@ let
       browserDeps.browser-use
     ];
 
-    # Keep browser_tool_set out of the default agent — Chromium is fetched
-    # lazily on first use and we don't want every conversation to trigger
-    # a download. Browser tools are still registered and available on request.
-    postPatch = ''
-      substituteInPlace openhands/tools/preset/subagents/default.md \
-        --replace-fail "  - browser_tool_set" ""
-    '';
+    # browser_tool_set is kept in default.md — Chromium is fetched lazily
+    # on first use via lazy-chromium.sh, so enabling it by default is fine.
 
     doCheck = false;
 

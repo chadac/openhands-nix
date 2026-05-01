@@ -23,6 +23,11 @@ Configuration via environment variables:
   SANDBOX_K8S_WORKSPACE_PVC_TEMPLATE — path to a PVC YAML template for per-sandbox volumes.
       Template variables: ${sandbox_id}, ${namespace}. Default ships with EBS gp3 / 10Gi.
   SANDBOX_K8S_WORKSPACE_PVC  — (legacy) name of a shared PVC mounted with per-sandbox subPaths.
+
+  Secret volume mounts:
+  SANDBOX_K8S_SECRET_VOLUMES — JSON array of secret volume mounts. Each entry:
+      {"secret": "secret-name", "mountPath": "/path", "defaultMode": 0o400}
+      Example: '[{"secret":"git-deploy-key","mountPath":"/root/.ssh","defaultMode":256}]'
 """
 
 from __future__ import annotations
@@ -142,6 +147,15 @@ class KubernetesSandboxService(SandboxService):
         )
         self.health_check_path = health_check_path
 
+        # IRSA role ARN for per-sandbox ServiceAccounts (Bedrock access, etc.)
+        self.sandbox_irsa_role_arn = os.getenv("SANDBOX_K8S_SA_IRSA_ROLE_ARN", "")
+
+        # Git repo to clone into /workspace/code/ via init container
+        self.sandbox_git_repo = os.getenv("SANDBOX_GIT_REPO", "")
+
+        # EFS filesystem ID for shared code volumes (companion dev environments)
+        self.efs_filesystem_id = os.getenv("SANDBOX_K8S_EFS_FILESYSTEM_ID", "")
+
         # External URL for sandbox Ingress routes
         self.external_host = os.getenv("SANDBOX_K8S_EXTERNAL_HOST", "")
         self.ingress_class = os.getenv("SANDBOX_K8S_INGRESS_CLASS", "alb-external")
@@ -171,6 +185,42 @@ class KubernetesSandboxService(SandboxService):
 
     def _service_name(self, sandbox_id: str) -> str:
         return f"oh-sandbox-{sandbox_id}"
+
+    def _sandbox_sa_name(self, sandbox_id: str) -> str:
+        return f"sandbox-{sandbox_id}"
+
+    def _ensure_sandbox_sa(self, sandbox_id: str) -> str:
+        """Create a per-sandbox ServiceAccount with IRSA annotation. Returns the SA name."""
+        sa_name = self._sandbox_sa_name(sandbox_id)
+
+        annotations = {}
+        if self.sandbox_irsa_role_arn:
+            annotations["eks.amazonaws.com/role-arn"] = self.sandbox_irsa_role_arn
+
+        sa = client.V1ServiceAccount(
+            metadata=client.V1ObjectMeta(
+                name=sa_name,
+                namespace=self.namespace,
+                labels={
+                    _LABEL_MANAGED_BY: _LABEL_MANAGED_BY_VALUE,
+                    _LABEL_SANDBOX_ID: sandbox_id,
+                },
+                annotations=annotations,
+            ),
+        )
+
+        try:
+            self._core_v1.create_namespaced_service_account(
+                namespace=self.namespace, body=sa,
+            )
+            logger.info("Created sandbox SA %s", sa_name)
+        except ApiException as e:
+            if e.status == 409:
+                logger.info("Sandbox SA %s already exists", sa_name)
+            else:
+                raise
+
+        return sa_name
 
     def _ingress_name(self, sandbox_id: str) -> str:
         return f"oh-sandbox-{sandbox_id}"
@@ -208,7 +258,12 @@ class KubernetesSandboxService(SandboxService):
 
         raise SandboxError(f'No agent server URL found for sandbox: {sandbox.id}')
 
-    def _create_sandbox_ingress(self, sandbox_id: str, labels: dict[str, str]) -> None:
+    def _create_sandbox_ingress(
+        self,
+        sandbox_id: str,
+        labels: dict[str, str],
+        owner_ref: client.V1OwnerReference | None = None,
+    ) -> None:
         """Create a per-sandbox Ingress that routes through the shared ALB."""
         path_prefix = self._sandbox_path_prefix(sandbox_id)
         ingress = client.V1Ingress(
@@ -218,6 +273,7 @@ class KubernetesSandboxService(SandboxService):
                 name=self._ingress_name(sandbox_id),
                 namespace=self.namespace,
                 labels=labels,
+                owner_references=[owner_ref] if owner_ref else None,
                 annotations={
                     "alb.ingress.kubernetes.io/group.name": self.ingress_group,
                     # No OIDC auth — sandbox uses session API key
@@ -272,6 +328,23 @@ class KubernetesSandboxService(SandboxService):
         except ApiException as e:
             logger.warning("Failed to create sandbox Ingress (non-fatal): %s", e)
 
+    def _get_job_owner_ref(self, sandbox_id: str) -> client.V1OwnerReference | None:
+        """Look up the sandbox Job and return an ownerReference for it."""
+        try:
+            job = self._batch_v1.read_namespaced_job(
+                name=self._job_name(sandbox_id),
+                namespace=self.namespace,
+            )
+            return client.V1OwnerReference(
+                api_version="batch/v1",
+                kind="Job",
+                name=job.metadata.name,
+                uid=job.metadata.uid,
+                block_owner_deletion=False,
+            )
+        except ApiException:
+            return None
+
     def _ensure_sandbox_ingress(self, sandbox_id: str, labels: dict[str, str]) -> None:
         """Ensure Ingress exists for a running sandbox (idempotent)."""
         try:
@@ -282,7 +355,8 @@ class KubernetesSandboxService(SandboxService):
         except ApiException as e:
             if e.status == 404:
                 logger.info("Sandbox Ingress %s missing — recreating", sandbox_id)
-                self._create_sandbox_ingress(sandbox_id, labels)
+                owner_ref = self._get_job_owner_ref(sandbox_id)
+                self._create_sandbox_ingress(sandbox_id, labels, owner_ref=owner_ref)
             else:
                 logger.warning("Failed to check sandbox Ingress %s: %s", sandbox_id, e)
 
@@ -357,6 +431,124 @@ class KubernetesSandboxService(SandboxService):
                 return pvc_name
             logger.error("Failed to create workspace PVC %s: %s", pvc_name, e)
             return None
+
+    def _ensure_efs_directory(self, sandbox_id: str) -> None:
+        """Run a short-lived Job to create the EFS subdirectory for this sandbox.
+
+        The EFS CSI driver requires the subdirectory to exist before a PV can
+        reference it via volume_handle.  This mounts the EFS root (no subpath)
+        and runs ``mkdir -p /{sandbox_id}``.
+        """
+        import time as _time
+
+        job_name = f"efs-init-{sandbox_id[:16]}"
+
+        # Check if Job already completed
+        try:
+            job = self._batch_v1.read_namespaced_job(job_name, self.namespace)
+            if job.status.succeeded and job.status.succeeded > 0:
+                logger.info("EFS init job %s already completed", job_name)
+                return
+        except client.ApiException as e:
+            if e.status != 404:
+                raise
+
+        # Temporary PV/PVC for EFS root (no subpath)
+        root_pv_name = f"efs-root-{sandbox_id[:16]}"
+        root_pvc_name = f"efs-root-{sandbox_id[:16]}"
+
+        try:
+            self._core_v1.read_persistent_volume(root_pv_name)
+        except client.ApiException as e:
+            if e.status == 404:
+                self._core_v1.create_persistent_volume(client.V1PersistentVolume(
+                    metadata=client.V1ObjectMeta(name=root_pv_name),
+                    spec=client.V1PersistentVolumeSpec(
+                        capacity={"storage": "1Gi"},
+                        volume_mode="Filesystem",
+                        access_modes=["ReadWriteMany"],
+                        persistent_volume_reclaim_policy="Delete",
+                        storage_class_name="",
+                        csi=client.V1CSIPersistentVolumeSource(
+                            driver="efs.csi.aws.com",
+                            volume_handle=self.efs_filesystem_id,
+                        ),
+                    ),
+                ))
+            else:
+                raise
+
+        try:
+            self._core_v1.read_namespaced_persistent_volume_claim(root_pvc_name, self.namespace)
+        except client.ApiException as e:
+            if e.status == 404:
+                self._core_v1.create_namespaced_persistent_volume_claim(
+                    self.namespace,
+                    client.V1PersistentVolumeClaim(
+                        metadata=client.V1ObjectMeta(name=root_pvc_name, namespace=self.namespace),
+                        spec=client.V1PersistentVolumeClaimSpec(
+                            access_modes=["ReadWriteMany"],
+                            storage_class_name="",
+                            volume_name=root_pv_name,
+                            resources=client.V1VolumeResourceRequirements(
+                                requests={"storage": "1Gi"},
+                            ),
+                        ),
+                    ),
+                )
+            else:
+                raise
+
+        # Create the mkdir Job
+        try:
+            self._batch_v1.create_namespaced_job(self.namespace, client.V1Job(
+                metadata=client.V1ObjectMeta(name=job_name, namespace=self.namespace),
+                spec=client.V1JobSpec(
+                    ttl_seconds_after_finished=60,
+                    template=client.V1PodTemplateSpec(
+                        spec=client.V1PodSpec(
+                            restart_policy="Never",
+                            containers=[client.V1Container(
+                                name="init",
+                                image="busybox:latest",
+                                command=["sh", "-c", f"mkdir -p /efs/{sandbox_id} && echo done"],
+                                volume_mounts=[client.V1VolumeMount(
+                                    name="efs-root", mount_path="/efs",
+                                )],
+                            )],
+                            volumes=[client.V1Volume(
+                                name="efs-root",
+                                persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                                    claim_name=root_pvc_name,
+                                ),
+                            )],
+                        ),
+                    ),
+                ),
+            ))
+            logger.info("Created EFS init job %s", job_name)
+        except client.ApiException as e:
+            if e.status != 409:
+                raise
+
+        # Wait for completion (up to 2 minutes)
+        for _ in range(60):
+            _time.sleep(2)
+            job = self._batch_v1.read_namespaced_job(job_name, self.namespace)
+            if job.status.succeeded and job.status.succeeded > 0:
+                logger.info("EFS init job %s completed", job_name)
+                break
+            if job.status.failed and job.status.failed > 0:
+                raise RuntimeError(f"EFS init job {job_name} failed")
+        else:
+            raise RuntimeError(f"EFS init job {job_name} timed out")
+
+        # Clean up temporary root PV/PVC
+        try:
+            self._core_v1.delete_namespaced_persistent_volume_claim(root_pvc_name, self.namespace)
+            self._core_v1.delete_persistent_volume(root_pv_name)
+        except client.ApiException:
+            pass  # Best effort
 
     def _sandbox_id_from_job(self, job: client.V1Job) -> str:
         """Extract sandbox ID from Job labels."""
@@ -682,6 +874,14 @@ class KubernetesSandboxService(SandboxService):
         if self.external_host:
             env_vars["OPENHANDS_CONVERSATION_URL"] = f"https://{self.external_host}/conversations/{sandbox_id}"
 
+        # Path to projected env-manager authentication token
+        env_vars["ENV_MANAGER_TOKEN_PATH"] = "/var/run/secrets/env-manager/token"
+
+        # Broker service URL and token path for git credential helper
+        broker_url = os.getenv("SANDBOX_BROKER_URL", "http://openhands-broker.openhands.svc.cluster.local:8080")
+        env_vars["BROKER_URL"] = broker_url
+        env_vars["BROKER_TOKEN_PATH"] = "/var/run/secrets/broker/token"
+
         # NIX_PACKAGES for dynamic Nix package installation
         nix_packages = os.getenv("SANDBOX_NIX_PACKAGES", "")
         if nix_packages:
@@ -722,6 +922,113 @@ class KubernetesSandboxService(SandboxService):
                         sub_path=f"sandboxes/{sandbox_id}",
                     )
                 )
+
+        # Code volume: EFS-backed PVC for sharing code with companion environments.
+        # Created here at sandbox start so the init container can clone directly into EFS.
+        # The env-manager later creates a matching PVC in the app namespace pointing to
+        # the same EFS path, giving the companion env immediate access to the code.
+        code_mount_path = os.getenv("SANDBOX_K8S_CODE_MOUNT_PATH", "/workspace/code")
+        code_pvc_name: str | None = None
+        if self.efs_filesystem_id:
+            # Ensure the EFS subdirectory exists before creating the PV
+            self._ensure_efs_directory(sandbox_id)
+
+            code_pvc_name = f"code-{sandbox_id}"
+            code_pv_name = f"code-{sandbox_id}-sandbox"
+            efs_path = f"/{sandbox_id}"
+            try:
+                self._core_v1.read_persistent_volume(code_pv_name)
+            except client.ApiException as e:
+                if e.status == 404:
+                    self._core_v1.create_persistent_volume(client.V1PersistentVolume(
+                        metadata=client.V1ObjectMeta(name=code_pv_name),
+                        spec=client.V1PersistentVolumeSpec(
+                            capacity={"storage": "10Gi"},
+                            volume_mode="Filesystem",
+                            access_modes=["ReadWriteMany"],
+                            persistent_volume_reclaim_policy="Retain",
+                            storage_class_name="",
+                            csi=client.V1CSIPersistentVolumeSource(
+                                driver="efs.csi.aws.com",
+                                volume_handle=f"{self.efs_filesystem_id}:{efs_path}",
+                            ),
+                        ),
+                    ))
+                    logger.info(f"Created EFS PV {code_pv_name}")
+                else:
+                    raise
+            try:
+                self._core_v1.read_namespaced_persistent_volume_claim(code_pvc_name, self.namespace)
+            except client.ApiException as e:
+                if e.status == 404:
+                    self._core_v1.create_namespaced_persistent_volume_claim(
+                        self.namespace,
+                        client.V1PersistentVolumeClaim(
+                            metadata=client.V1ObjectMeta(
+                                name=code_pvc_name,
+                                namespace=self.namespace,
+                                labels={
+                                    "openhands.ai/sandbox-id": sandbox_id,
+                                    "openhands.ai/purpose": "code-volume",
+                                },
+                            ),
+                            spec=client.V1PersistentVolumeClaimSpec(
+                                access_modes=["ReadWriteMany"],
+                                storage_class_name="",
+                                volume_name=code_pv_name,
+                                resources=client.V1VolumeResourceRequirements(
+                                    requests={"storage": "10Gi"},
+                                ),
+                            ),
+                        ),
+                    )
+                    logger.info(f"Created EFS PVC {code_pvc_name}")
+                else:
+                    raise
+            volume_mounts.append(
+                client.V1VolumeMount(name="code", mount_path=code_mount_path)
+            )
+            logger.info(f"Mounting code volume {code_pvc_name} at {code_mount_path}")
+
+        # Forward code mount path to sandbox so agents know where code lives
+        env_vars["CODE_MOUNT_PATH"] = code_mount_path
+
+        # Projected volume mount for env-manager authentication token
+        volume_mounts.append(
+            client.V1VolumeMount(
+                name="env-manager-token",
+                mount_path="/var/run/secrets/env-manager",
+                read_only=True,
+            )
+        )
+
+        # Projected volume mount for broker authentication token
+        volume_mounts.append(
+            client.V1VolumeMount(
+                name="broker-token",
+                mount_path="/var/run/secrets/broker",
+                read_only=True,
+            )
+        )
+
+        # Secret volume mounts (SSH keys, config files, etc.)
+        secret_volumes_json = os.getenv("SANDBOX_K8S_SECRET_VOLUMES", "")
+        secret_volume_specs: list[dict] = []
+        if secret_volumes_json:
+            try:
+                secret_volume_specs = json.loads(secret_volumes_json)
+            except json.JSONDecodeError:
+                logger.warning("Invalid SANDBOX_K8S_SECRET_VOLUMES JSON, ignoring")
+
+        for i, sv in enumerate(secret_volume_specs):
+            vol_name = f"secret-{i}"
+            volume_mounts.append(
+                client.V1VolumeMount(
+                    name=vol_name,
+                    mount_path=sv["mountPath"],
+                    read_only=sv.get("readOnly", True),
+                )
+            )
 
         # Secret-based env vars (tokens, credentials) — injected via envFrom
         # so secret values never appear in the Job spec.
@@ -774,18 +1081,117 @@ class KubernetesSandboxService(SandboxService):
                     ),
                 )
             )
+        # Code volume (EFS, if discovered above)
+        if code_pvc_name:
+            volumes.append(
+                client.V1Volume(
+                    name="code",
+                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
+                        claim_name=code_pvc_name,
+                    ),
+                )
+            )
+        # Secret volumes
+        for i, sv in enumerate(secret_volume_specs):
+            vol_name = f"secret-{i}"
+            volumes.append(
+                client.V1Volume(
+                    name=vol_name,
+                    secret=client.V1SecretVolumeSource(
+                        secret_name=sv["secret"],
+                        default_mode=sv.get("defaultMode", 0o400),
+                    ),
+                )
+            )
+
+        # Projected volume for env-manager audience-scoped token
+        volumes.append(
+            client.V1Volume(
+                name="env-manager-token",
+                projected=client.V1ProjectedVolumeSource(
+                    sources=[
+                        client.V1VolumeProjection(
+                            service_account_token=client.V1ServiceAccountTokenProjection(
+                                audience="env-manager",
+                                expiration_seconds=3600,
+                                path="token",
+                            )
+                        )
+                    ],
+                ),
+            )
+        )
+
+        # Projected volume for broker audience-scoped token
+        volumes.append(
+            client.V1Volume(
+                name="broker-token",
+                projected=client.V1ProjectedVolumeSource(
+                    sources=[
+                        client.V1VolumeProjection(
+                            service_account_token=client.V1ServiceAccountTokenProjection(
+                                audience="openhands-broker",
+                                expiration_seconds=3600,
+                                path="token",
+                            )
+                        )
+                    ],
+                ),
+            )
+        )
+
+        # Init container: clone git repo into workspace before main container starts
+        init_containers = []
+        if self.sandbox_git_repo:
+            # Build volume mounts for the init container — needs workspace + SSH keys + code volume
+            init_mounts = []
+            if workspace_pvc:
+                init_mounts.append(
+                    client.V1VolumeMount(name="workspace", mount_path="/workspace")
+                )
+            if code_pvc_name:
+                init_mounts.append(
+                    client.V1VolumeMount(name="code", mount_path=code_mount_path)
+                )
+            for i, sv in enumerate(secret_volume_specs):
+                init_mounts.append(
+                    client.V1VolumeMount(
+                        name=f"secret-{i}",
+                        mount_path=sv["mountPath"],
+                        read_only=sv.get("readOnly", True),
+                    )
+                )
+            init_containers.append(
+                client.V1Container(
+                    name="git-clone",
+                    image="debian:bookworm-slim",
+                    command=["sh", "-c",
+                        "apt-get update -qq && apt-get install -y -qq git openssh-client >/dev/null 2>&1 && "
+                        "mkdir -p /tmp/ssh && cp -L /root/.ssh/* /tmp/ssh/ && chmod 700 /tmp/ssh && "
+                        "for f in /tmp/ssh/*; do chmod 600 \"$f\"; printf '\\n' >> \"$f\"; done && "
+                        "if [ ! -d /workspace/code/.git ]; then "
+                        "GIT_SSH_COMMAND='ssh -i /tmp/ssh/id_ed25519 -o StrictHostKeyChecking=no' "
+                        f"git clone {self.sandbox_git_repo} /workspace/code; "
+                        "else echo 'Repo already cloned, skipping'; fi"
+                    ],
+                    volume_mounts=init_mounts or None,
+                    resources=client.V1ResourceRequirements(
+                        requests={"cpu": "100m", "memory": "256Mi"},
+                    ),
+                )
+            )
 
         # Pod spec
         pod_spec = client.V1PodSpec(
+            init_containers=init_containers or None,
             containers=[container],
             volumes=volumes or None,
             restart_policy="Never",
         )
 
-        # Optional: service account
-        sa = os.getenv("SANDBOX_K8S_SERVICE_ACCOUNT")
-        if sa:
-            pod_spec.service_account_name = sa
+        # Per-sandbox ServiceAccount with IRSA annotation and projected token
+        sa_name = self._ensure_sandbox_sa(sandbox_id)
+        pod_spec.service_account_name = sa_name
 
         # Optional: node selector
         node_selector = _env_json("SANDBOX_K8S_NODE_SELECTOR")
@@ -828,13 +1234,23 @@ class KubernetesSandboxService(SandboxService):
         )
 
         try:
-            self._batch_v1.create_namespaced_job(
+            created_job = self._batch_v1.create_namespaced_job(
                 namespace=self.namespace,
                 body=job,
             )
             logger.info("Created sandbox Job %s (image=%s)", sandbox_id, image)
         except ApiException as e:
             raise RuntimeError(f"Failed to create sandbox Job: {e}") from e
+
+        # ownerReference so Service/Ingress are GC'd when the Job is TTL-cleaned.
+        # PVCs are intentionally NOT owned — they persist across sandbox restarts.
+        owner_ref = client.V1OwnerReference(
+            api_version="batch/v1",
+            kind="Job",
+            name=created_job.metadata.name,
+            uid=created_job.metadata.uid,
+            block_owner_deletion=False,
+        )
 
         # Create a ClusterIP Service for stable networking
         service = client.V1Service(
@@ -844,6 +1260,7 @@ class KubernetesSandboxService(SandboxService):
                 name=self._service_name(sandbox_id),
                 namespace=self.namespace,
                 labels=labels,
+                owner_references=[owner_ref],
             ),
             spec=client.V1ServiceSpec(
                 selector={_LABEL_SANDBOX_ID: sandbox_id},
@@ -865,7 +1282,7 @@ class KubernetesSandboxService(SandboxService):
 
         # Create an Ingress for external access (if external_host is configured)
         if self.external_host and self.ingress_group:
-            self._create_sandbox_ingress(sandbox_id, labels)
+            self._create_sandbox_ingress(sandbox_id, labels, owner_ref=owner_ref)
 
         return SandboxInfo(
             id=sandbox_id,
@@ -885,7 +1302,20 @@ class KubernetesSandboxService(SandboxService):
             )
         except ApiException as e:
             if e.status == 404:
-                return False
+                # Job is gone — check if PVC still exists and recreate
+                pvc_name = f"oh-workspace-{sandbox_id}"
+                try:
+                    self._core_v1.read_namespaced_persistent_volume_claim(
+                        name=pvc_name, namespace=self.namespace,
+                    )
+                except ApiException:
+                    return False
+                logger.info(
+                    "Resume: Job %s gone but PVC exists — recreating",
+                    sandbox_id,
+                )
+                info = await self._recreate_sandbox(sandbox_id)
+                return info is not None
             raise
 
         if not job.spec.suspend:
@@ -966,6 +1396,33 @@ class KubernetesSandboxService(SandboxService):
 
         # Delete the Ingress (if it exists)
         self._delete_sandbox_ingress(sandbox_id)
+
+        # Delete the per-sandbox ServiceAccount
+        try:
+            self._core_v1.delete_namespaced_service_account(
+                name=self._sandbox_sa_name(sandbox_id),
+                namespace=self.namespace,
+            )
+            logger.info("Deleted sandbox SA %s", sandbox_id)
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning("Failed to delete sandbox SA %s: %s", sandbox_id, e)
+
+        # Delete EFS code volume PVC and PV (if they exist)
+        code_pvc = f"code-{sandbox_id}"
+        code_pv = f"code-{sandbox_id}-sandbox"
+        try:
+            self._core_v1.delete_namespaced_persistent_volume_claim(code_pvc, self.namespace)
+            logger.info("Deleted code PVC %s", code_pvc)
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning("Failed to delete code PVC %s: %s", code_pvc, e)
+        try:
+            self._core_v1.delete_persistent_volume(code_pv)
+            logger.info("Deleted code PV %s", code_pv)
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning("Failed to delete code PV %s: %s", code_pv, e)
 
         return deleted
 

@@ -172,6 +172,21 @@ in
                       key = "atlassian-cloud-id";
                       optional = true;
                     };
+                    GITHUB_APP_ID.valueFrom.secretKeyRef = {
+                      name = cfg.secretName;
+                      key = "github-app-id";
+                      optional = true;
+                    };
+                    GITHUB_APP_PRIVATE_KEY.valueFrom.secretKeyRef = {
+                      name = cfg.secretName;
+                      key = "github-app-private-key";
+                      optional = true;
+                    };
+                    GITHUB_APP_INSTALLATION_ID.valueFrom.secretKeyRef = {
+                      name = cfg.secretName;
+                      key = "github-app-installation-id";
+                      optional = true;
+                    };
                   };
                   livenessProbe = {
                     httpGet = { path = "/health"; port = "http"; };
