@@ -49,6 +49,11 @@ let
     wget
     jq
     openssh
+    # Fonts + fontconfig — required for Chromium/browser-use to render pages
+    # without thousands of HarfBuzz errors that crash the CDP debug interface
+    fontconfig
+    freefont_ttf
+    dejavu_fonts
   ];
 
   # Additional packages for the full variant
@@ -57,6 +62,11 @@ let
     gh
     docker-client
   ];
+
+  # Fontconfig configuration pointing to Nix font paths
+  fontsConf = pkgs.makeFontsConf {
+    fontDirectories = [ pkgs.freefont_ttf pkgs.dejavu_fonts ];
+  };
 
   entrypoint = pkgs.writeShellApplication {
     name = "openhands-entrypoint";
@@ -238,6 +248,7 @@ let
         "SU_TO_USER=false"
         "NIX_SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
         "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+        "FONTCONFIG_FILE=${fontsConf}"
       ] ++ vscodeEnv;
     };
   };
