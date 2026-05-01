@@ -154,18 +154,24 @@ let
       echo "root:x:0:" > $out/etc/group
       echo "nixbld:x:30000:$(seq -s, 1 10 | sed 's/[0-9]*/nixbld&/g')" >> $out/etc/group
 
+      # Symlink chromium into /usr/bin so browser-use can find it
+      # (browser-use's _find_installed_browser_path checks /usr/bin/chromium)
+      mkdir -p $out/usr/bin
+      ln -s ${lazyChromium}/bin/chromium $out/usr/bin/chromium
+
       # browser-use config: increase page load wait times for React SPAs
       # (default 0.5s is too short for heavy JS bundles; React apps with
       # persistent WebSocket connections can also cause networkidle to hang)
       mkdir -p $out/root/.config/browseruse
-      cat > $out/root/.config/browseruse/config.json <<'BROWSERCONF'
+      cat > $out/root/.config/browseruse/config.json <<BROWSERCONF
       {
         "browser_profile": {
           "default": {
             "id": "default",
             "default": true,
             "wait_for_network_idle_page_load_time": 5.0,
-            "minimum_wait_page_load_time": 2.0
+            "minimum_wait_page_load_time": 2.0,
+            "executable_path": "${lazyChromium}/bin/chromium"
           }
         }
       }

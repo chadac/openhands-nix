@@ -993,6 +993,14 @@ class KubernetesSandboxService(SandboxService):
         # Forward code mount path to sandbox so agents know where code lives
         env_vars["CODE_MOUNT_PATH"] = code_mount_path
 
+        # Tmpfs mounts for Chromium browser support
+        volume_mounts.append(
+            client.V1VolumeMount(name="tmp", mount_path="/tmp")
+        )
+        volume_mounts.append(
+            client.V1VolumeMount(name="dshm", mount_path="/dev/shm")
+        )
+
         # Projected volume mount for env-manager authentication token
         volume_mounts.append(
             client.V1VolumeMount(
@@ -1104,6 +1112,24 @@ class KubernetesSandboxService(SandboxService):
                 )
             )
 
+        # Tmpfs volumes for Chromium browser support.
+        # /tmp must be writable for shared memory fallback (--disable-dev-shm-usage).
+        # /dev/shm needs >64M for Chromium's shared memory requirements.
+        volumes.append(
+            client.V1Volume(
+                name="tmp",
+                empty_dir=client.V1EmptyDirVolumeSource(medium="Memory"),
+            )
+        )
+        volumes.append(
+            client.V1Volume(
+                name="dshm",
+                empty_dir=client.V1EmptyDirVolumeSource(
+                    medium="Memory", size_limit="512Mi"
+                ),
+            )
+        )
+
         # Projected volume for env-manager audience-scoped token
         volumes.append(
             client.V1Volume(
@@ -1169,10 +1195,14 @@ class KubernetesSandboxService(SandboxService):
                         "apt-get update -qq && apt-get install -y -qq git openssh-client >/dev/null 2>&1 && "
                         "mkdir -p /tmp/ssh && cp -L /root/.ssh/* /tmp/ssh/ && chmod 700 /tmp/ssh && "
                         "for f in /tmp/ssh/*; do chmod 600 \"$f\"; printf '\\n' >> \"$f\"; done && "
-                        "if [ ! -d /workspace/code/.git ]; then "
+                        "if [ -d /workspace/code/.git ]; then "
+                        "echo 'Repo already cloned, skipping'; "
+                        "elif [ -d /workspace/code ] && [ \"$(ls -A /workspace/code)\" ]; then "
+                        "echo 'WARNING: /workspace/code exists but is not a git repo, skipping clone'; "
+                        "else "
                         "GIT_SSH_COMMAND='ssh -i /tmp/ssh/id_ed25519 -o StrictHostKeyChecking=no' "
                         f"git clone {self.sandbox_git_repo} /workspace/code; "
-                        "else echo 'Repo already cloned, skipping'; fi"
+                        "fi"
                     ],
                     volume_mounts=init_mounts or None,
                     resources=client.V1ResourceRequirements(

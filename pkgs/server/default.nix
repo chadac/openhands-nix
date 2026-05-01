@@ -447,6 +447,52 @@ PYEOF
 
     async def get_response(self, path: str, scope: Scope) -> Response:'
 
+      # Import V1EmptyDirVolumeSource for tmpfs volumes in kubernetes_runtime.py
+      substituteInPlace $SITE/openhands/runtime/impl/kubernetes/kubernetes_runtime.py \
+        --replace-fail \
+          "    V1Volume," \
+          "    V1EmptyDirVolumeSource,
+    V1Volume,"
+
+      # Add tmpfs volumes for /tmp and /dev/shm in Kubernetes sandbox pods.
+      # Chromium needs a writable /tmp (for --disable-dev-shm-usage fallback)
+      # and a larger /dev/shm (default 64MB is too small for shared memory).
+      # The Nix container has a read-only overlay /tmp by default.
+      substituteInPlace $SITE/openhands/runtime/impl/kubernetes/kubernetes_runtime.py \
+        --replace-fail \
+          "volume_mounts = [
+            V1VolumeMount(
+                name='workspace-volume',
+                mount_path=self.config.workspace_mount_path_in_sandbox,
+            ),
+        ]
+        volumes = [
+            V1Volume(
+                name='workspace-volume',
+                persistent_volume_claim=V1PersistentVolumeClaimVolumeSource(
+                    claim_name=self._get_pvc_name(self.pod_name)
+                ),
+            )
+        ]" \
+          "volume_mounts = [
+            V1VolumeMount(
+                name='workspace-volume',
+                mount_path=self.config.workspace_mount_path_in_sandbox,
+            ),
+            V1VolumeMount(name='tmp', mount_path='/tmp'),
+            V1VolumeMount(name='dshm', mount_path='/dev/shm'),
+        ]
+        volumes = [
+            V1Volume(
+                name='workspace-volume',
+                persistent_volume_claim=V1PersistentVolumeClaimVolumeSource(
+                    claim_name=self._get_pvc_name(self.pod_name)
+                ),
+            ),
+            V1Volume(name='tmp', empty_dir=V1EmptyDirVolumeSource(medium='Memory')),
+            V1Volume(name='dshm', empty_dir=V1EmptyDirVolumeSource(medium='Memory', size_limit='512Mi')),
+        ]"
+
       # Fix ProcessSandboxService bugs:
       # 1. _get_process_status: idle server is STATUS_SLEEPING, not STATUS_RUNNING
       # 2. _start_agent_process: stdout/stderr=PIPE without reading causes deadlock
