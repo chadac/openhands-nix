@@ -57,19 +57,118 @@ auth_header() {
   echo "Authorization: Bearer $(get_token)"
 }
 
+# Get a GitHub token from the credential broker for API calls.
+get_github_token() {
+  local broker_url="${BROKER_URL:-}"
+  local broker_token_path="${BROKER_TOKEN_PATH:-/var/run/secrets/broker/token}"
+
+  if [ -n "$broker_url" ] && [ -f "$broker_token_path" ]; then
+    local broker_token creds
+    broker_token=$(cat "$broker_token_path")
+    creds=$(curl -sf -H "Authorization: Bearer $broker_token" "$broker_url/git-credentials" 2>/dev/null) || true
+    if [ -n "$creds" ]; then
+      local password
+      password=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin).get('password',''))" 2>/dev/null) || true
+      if [ -n "$password" ]; then
+        echo "$password"
+        return
+      fi
+    fi
+  fi
+
+  # Fall back to GITHUB_TOKEN env var
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    echo "$GITHUB_TOKEN"
+    return
+  fi
+
+  echo "Error: No GitHub token available (broker not reachable, GITHUB_TOKEN not set)" >&2
+  exit 1
+}
+
+# Extract GitHub repo slug (owner/repo) from the git remote URL.
+get_repo_slug() {
+  local code_dir="/workspace/code"
+  local remote_url
+  remote_url=$(cd "$code_dir" && git remote get-url origin 2>/dev/null) || {
+    echo "Error: Could not get git remote URL" >&2
+    exit 1
+  }
+  # Handle both HTTPS and SSH URLs:
+  #   https://github.com/owner/repo.git  or  https://@github.com/owner/repo.git
+  #   git@github.com:owner/repo.git
+  echo "$remote_url" | sed -E 's|^https?://(@)?github\.com/||; s|^git@github\.com:||; s|\.git$||'
+}
+
+# Detect the PR number associated with the current git branch.
+# Uses GitHub API directly (no `gh` CLI required).
+get_pr_number() {
+  local code_dir="/workspace/code"
+  if [ ! -d "$code_dir/.git" ]; then
+    echo "Error: No git repository found at $code_dir" >&2
+    exit 1
+  fi
+
+  local branch repo_slug token result pr_number
+  branch=$(cd "$code_dir" && git rev-parse --abbrev-ref HEAD 2>/dev/null) || {
+    echo "Error: Could not determine current git branch" >&2
+    exit 1
+  }
+  repo_slug=$(get_repo_slug)
+  token=$(get_github_token)
+
+  result=$(curl -sf -H "Authorization: token $token" \
+    -H "Accept: application/vnd.github.v3+json" \
+    "https://api.github.com/repos/${repo_slug}/pulls?head=${repo_slug%%/*}:${branch}&state=open" 2>/dev/null) || {
+    echo "Error: Failed to query GitHub API for PRs" >&2
+    exit 1
+  }
+
+  pr_number=$(echo "$result" | python3 -c "
+import sys, json
+prs = json.load(sys.stdin)
+if not prs:
+    sys.exit(1)
+print(prs[0]['number'])
+" 2>/dev/null) || {
+    echo "Error: No pull request found for branch '${branch}'." >&2
+    echo "Create a PR first: cd /workspace/code && git push -u origin ${branch}" >&2
+    exit 1
+  }
+
+  echo "$pr_number"
+}
+
 CONV_ID=""
 SANDBOX_ID=""
 
 cmd_create() {
   CONV_ID=$(get_conversation_id)
   SANDBOX_ID=$(get_sandbox_id)
+  local pr_number pr_title
+  pr_number=$(get_pr_number)
+  local repo_slug token
+  repo_slug=$(get_repo_slug)
+  token=$(get_github_token)
+  pr_title=$(curl -sf -H "Authorization: token $token" \
+    -H "Accept: application/vnd.github.v3+json" \
+    "https://api.github.com/repos/${repo_slug}/pulls/${pr_number}" 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('title',''))" 2>/dev/null || echo "")
 
-  echo "Creating companion environment..."
-  local result
+  echo "Creating companion environment for PR #${pr_number}..."
+  local result payload
+  payload=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'sandbox_id': sys.argv[1],
+    'pr_number': int(sys.argv[2]),
+    'pr_title': sys.argv[3],
+}))
+" "$SANDBOX_ID" "$pr_number" "$pr_title")
   result=$(curl -sf -X POST "${ENV_MANAGER_URL}/environments/${CONV_ID}" \
     -H "$(auth_header)" \
     -H "Content-Type: application/json" \
-    -d "{\"sandbox_id\": \"${SANDBOX_ID}\"}" 2>&1) || {
+    -d "${payload}" 2>&1) || {
     echo "Error creating environment:" >&2
     echo "$result" >&2
     exit 1
@@ -96,11 +195,13 @@ cmd_status() {
     exit 1
   }
 
-  local domain status created_at
+  local domain status pr_number created_at
   domain=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['domain'])")
   status=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])")
+  pr_number=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['pr_number'])")
   created_at=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin).get('created_at','unknown'))")
 
+  echo "PR:      #${pr_number}"
   echo "Status:  $status"
   echo "URL:     https://${domain}"
   echo "Created: $created_at"
@@ -207,7 +308,7 @@ cmd_help() {
   echo "Usage: review-app <command> [args]"
   echo ""
   echo "Commands:"
-  echo "  create              Create companion environment"
+  echo "  create              Create companion environment (requires PR)"
   echo "  status              Check environment status"
   echo "  wait                Wait until environment is ready"
   echo "  restart             Restart environment pods"
