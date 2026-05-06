@@ -126,6 +126,11 @@
             inherit (serviceImages) webhooks-image lifecycle-image broker-image;
           };
 
+          # Expose image builders so consumers can create customized images
+          # with extra skills, packages, etc.
+          # Usage: openhands-nix.legacyPackages.${system}.agentServerImages.mkAgentServerImage { ... }
+          legacyPackages = { inherit agentServerImages; };
+
           # checks = packages (import checks) + segmented test suite
           checks = {
             inherit cli openhands-nix;

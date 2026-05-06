@@ -48,9 +48,9 @@ let
     sandbox = false
     NIX_CONF
 
-    # Nix-specific skills for the agent
+    # Skills for the agent (from all skill directories)
     mkdir -p $out/root/.openhands/skills
-    cp ${skillsDir}/*.md $out/root/.openhands/skills/
+    ${lib.concatMapStringsSep "\n" (d: "cp ${d}/*.md $out/root/.openhands/skills/") (lib.toList skillsDir)}
   '';
 
   entrypoint = pkgs.writeShellApplication {

@@ -82,7 +82,6 @@ let
     binaries = [ "chromium" ];
   };
   lazyVscode = pkgs.writeShellScriptBin "openvscode-server" (builtins.readFile ./lazy-vscode.sh);
-  reviewApp = pkgs.writeShellScriptBin "review-app" (builtins.readFile ./review-app.sh);
   gitCredentialBroker = pkgs.writeShellScriptBin "git-credential-broker" (builtins.readFile ./git-credential-broker.sh);
 
   # Shims for upstream compatibility: the upstream kubernetes_runtime hardcodes
@@ -111,6 +110,7 @@ let
     tag ? "latest",
     extraPackages ? [],
     extraPythonPackages ? [],
+    extraSkillsDirs ? [],
     port ? 8000,
     variant ? "full",
   }:
@@ -134,7 +134,6 @@ let
       lazyVscode
       micromambaShim
       poetryShim
-      reviewApp
       gitCredentialBroker
     ] ++ extraPackages;
 
@@ -187,9 +186,9 @@ let
       }
       BROWSERCONF
 
-      # Nix-specific skills for the agent
+      # Skills for the agent (base + extra skill directories)
       mkdir -p $out/root/.openhands/skills
-      cp ${skillsDir}/*.md $out/root/.openhands/skills/
+      ${lib.concatMapStringsSep "\n" (d: "cp ${d}/*.md $out/root/.openhands/skills/") ((lib.toList skillsDir) ++ extraSkillsDirs)}
 
       ${lib.optionalString (variant == "full") ''
         # OpenVSCode Server: symlink into expected location

@@ -115,7 +115,7 @@ in
 
     domain = mkOption {
       type = types.str;
-      description = "Domain for the OpenHands UI (e.g. openhands.dev.aeonai.com)";
+      description = "Domain for the OpenHands UI";
     };
 
     certArn = mkOption {
