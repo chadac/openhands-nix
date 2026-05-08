@@ -26,19 +26,23 @@ let
     "mkdir -p /nix && ln -sfn /nix-csi/nix/store /nix/store && ln -sfn /nix-csi/nix/var /nix/var && exec /nix/var/result/bin/openhands-server-entrypoint"
   ] else null;
 
-  # Sandbox image env vars (only in image mode)
+  # Sandbox image env var (only in image mode)
   sandboxImageEnvs = lib.optionalAttrs (!useNixCsi) {
     SANDBOX_K8S_IMAGE.value = "${cfg.sandbox.image}:${cfg.sandbox.imageTag}";
-    SANDBOX_K8S_IMAGE_PULL_POLICY.value = cfg.imagePullPolicy;
   };
 
-  # Sandbox Ingress env vars (for per-sandbox ALB routing)
-  sandboxIngressEnvs = lib.optionalAttrs (cfg.sandbox.externalHost != "") {
-    SANDBOX_K8S_EXTERNAL_HOST.value = cfg.sandbox.externalHost;
-  } // lib.optionalAttrs (cfg.sandbox.ingressGroup != "") {
-    SANDBOX_K8S_INGRESS_GROUP.value = cfg.sandbox.ingressGroup;
-  } // lib.optionalAttrs (cfg.sandbox.ingressClass != "alb-external") {
-    SANDBOX_K8S_INGRESS_CLASS.value = cfg.sandbox.ingressClass;
+  # Sandbox kubenix template config (sandbox.* option overrides)
+  sandboxTemplateConfig = {
+    resourceRequests = builtins.fromJSON cfg.sandbox.resourceRequests;
+    resourceLimits = builtins.fromJSON cfg.sandbox.resourceLimits;
+  } // lib.optionalAttrs (!useNixCsi) {
+    imagePullPolicy = cfg.imagePullPolicy;
+  } // lib.optionalAttrs (cfg.sandbox.externalHost != "") {
+    ingress = {
+      enable = true;
+      host = cfg.sandbox.externalHost;
+      ingressClassName = cfg.sandbox.ingressClass;
+    };
   };
 in
 {
@@ -171,11 +175,6 @@ in
         default = "";
         description = "External hostname for sandbox Ingress routes (enables per-sandbox Ingress creation)";
       };
-      ingressGroup = mkOption {
-        type = types.str;
-        default = "";
-        description = "ALB Ingress group name for sandbox Ingresses (must match the main server Ingress group)";
-      };
       ingressClass = mkOption {
         type = types.str;
         default = "alb";
@@ -234,7 +233,7 @@ in
           }
           {
             apiGroups = [ "" ];
-            resources = [ "services" ];
+            resources = [ "services" "serviceaccounts" ];
             verbs = [ "create" "get" "list" "watch" "delete" ];
           }
           {
@@ -336,8 +335,7 @@ in
                   env = lib.mkNamedList ({
                     RUNTIME.value = "kubernetes";
                     SANDBOX_K8S_NAMESPACE.value = namespace;
-                    SANDBOX_K8S_RESOURCE_REQUESTS.value = cfg.sandbox.resourceRequests;
-                    SANDBOX_K8S_RESOURCE_LIMITS.value = cfg.sandbox.resourceLimits;
+                    SANDBOX_K8S_TEMPLATE_CONFIG.value = builtins.toJSON sandboxTemplateConfig;
                     SANDBOX_NIX_PACKAGES.value = cfg.sandbox.nixPackages;
                     SANDBOX_K8S_ENV_SECRET.value = cfg.sandboxEnvSecretName;
                     OH_APP_CONVERSATION_SANDBOX_STARTUP_TIMEOUT.value = toString cfg.sandbox.startupTimeout;
@@ -352,7 +350,7 @@ in
                       key = "github-token";
                       optional = true;
                     };
-                  } // sandboxImageEnvs // sandboxIngressEnvs);
+                  } // sandboxImageEnvs);
                   startupProbe = {
                     httpGet = { path = "/"; port = "http"; };
                     failureThreshold = if useNixCsi then 60 else 30;

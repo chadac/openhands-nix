@@ -304,7 +304,7 @@ PYEOF
 """OpenHands Nix extensions — Kubernetes sandbox and other Nix-specific integrations."""
 PYEOF
       cp ${./kubernetes_sandbox.py} $SITE/openhands_nix/kubernetes_sandbox.py
-      cp ${./workspace-pvc-template.yaml} $SITE/openhands_nix/workspace-pvc-template.yaml
+      cp ${./kubenix_runtime.py} $SITE/openhands_nix/kubenix_runtime.py
       cp ${./strip_prefix_middleware.py} $SITE/openhands_nix/strip_prefix_middleware.py
 
       # Patch config_from_env() to recognize RUNTIME=kubernetes.
@@ -314,7 +314,7 @@ PYEOF
           "config.sandbox = ProcessSandboxServiceInjector()
         else:" \
           "config.sandbox = ProcessSandboxServiceInjector()
-        elif os.getenv('RUNTIME') == 'kubernetes':
+        elif os.getenv('RUNTIME') in ('kubernetes', 'openhands_nix.kubenix_runtime.KubenixRuntime'):
             from openhands_nix.kubernetes_sandbox import KubernetesSandboxServiceInjector
             config.sandbox = KubernetesSandboxServiceInjector()
         else:"
@@ -325,7 +325,7 @@ PYEOF
           "config.sandbox_spec = ProcessSandboxSpecServiceInjector()
         else:" \
           "config.sandbox_spec = ProcessSandboxSpecServiceInjector()
-        elif os.getenv('RUNTIME') == 'kubernetes':
+        elif os.getenv('RUNTIME') in ('kubernetes', 'openhands_nix.kubenix_runtime.KubenixRuntime'):
             from openhands_nix.kubernetes_sandbox import KubernetesSandboxSpecServiceInjector
             config.sandbox_spec = KubernetesSandboxSpecServiceInjector()
         else:"
@@ -394,7 +394,7 @@ PYEOF
             self.run_alembic()
         # Recover orphaned start tasks from previous server incarnation
         import os as _os
-        if _os.getenv("RUNTIME") == "kubernetes":
+        if _os.getenv("RUNTIME") in ("kubernetes", "openhands_nix.kubenix_runtime.KubenixRuntime"):
             try:
                 from openhands_nix.startup_recovery import recover_orphaned_start_tasks
                 import asyncio, logging

@@ -157,7 +157,7 @@ async def cleanup_idle_conversations() -> None:
             if exec_status in ("STOPPED",) or sandbox_status in ("PAUSED", "MISSING"):
                 continue
 
-            if exec_status not in ("AWAITING_USER_INPUT", "FINISHED"):
+            if exec_status not in ("AWAITING_USER_INPUT", "FINISHED", "IDLE"):
                 continue
 
             # Check pod age
@@ -193,7 +193,7 @@ async def cleanup_idle_conversations() -> None:
                 live_status = await _get_sandbox_execution_status(sandbox_id, cid, session_key)
                 if live_status is None:
                     continue
-                if live_status not in ("AWAITING_USER_INPUT", "FINISHED", "STOPPED", "PAUSED"):
+                if live_status not in ("AWAITING_USER_INPUT", "FINISHED", "STOPPED", "PAUSED", "IDLE"):
                     continue
 
             logger.info(

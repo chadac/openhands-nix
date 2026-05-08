@@ -1,16 +1,19 @@
 """Register the Kubernetes sandbox service with the OpenHands app server.
 
 This module is loaded at Python startup via a .pth file. It installs
-an import hook that monkey-patches config_from_env() to recognize
-RUNTIME=kubernetes, routing to KubernetesSandboxService.
+an import hook that monkey-patches config_from_env() to route
+RUNTIME=kubernetes to KubernetesSandboxService.
 
 All heavy imports are deferred until the hooked functions are actually
 called to avoid circular imports at startup.
 """
 
+import logging
 import os
 import importlib
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 class _KubernetesConfigHook:
@@ -78,7 +81,7 @@ class _KubernetesConfigHook:
 
 
 def _register():
-    if os.getenv("RUNTIME") != "kubernetes":
+    if os.getenv("RUNTIME") not in ("kubernetes", "openhands_nix.kubenix_runtime.KubenixRuntime"):
         return
     sys.meta_path.append(_KubernetesConfigHook())
 

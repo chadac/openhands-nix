@@ -8,9 +8,13 @@
       url = "github:nlewo/nix2container";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    kubenix = {
+      url = "github:hall/kubenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-parts, nix2container }:
+  outputs = inputs@{ self, nixpkgs, flake-parts, nix2container, kubenix }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
@@ -81,6 +85,8 @@
           # Full server image (UI + API)
           serverImages = import ./pkgs/images/server.nix {
             inherit pkgs lib pythonPackages sdkPackages serverPackages skillsDir n2c;
+            sandboxEvalDir = ./pkgs/server/sandbox-eval;
+            kubenixFlake = inputs.kubenix;
           };
 
           # Microservice container images
@@ -124,12 +130,15 @@
 
             # Microservice container images
             inherit (serviceImages) webhooks-image lifecycle-image broker-image;
+
           };
 
           # Expose image builders so consumers can create customized images
           # with extra skills, packages, etc.
           # Usage: openhands-nix.legacyPackages.${system}.agentServerImages.mkAgentServerImage { ... }
-          legacyPackages = { inherit agentServerImages; };
+          legacyPackages = {
+            inherit agentServerImages;
+          };
 
           # checks = packages (import checks) + segmented test suite
           checks = {
@@ -148,6 +157,8 @@
       flake = {
         # kubenix modules for deploying OpenHands on Kubernetes
         kubenixModules.openhands = ./kubernetes;
+        # Per-sandbox resource modules (used by sandbox-eval at runtime)
+        kubenixModules.sandboxTemplate = ./pkgs/server/sandbox-eval;
       };
     };
 }

@@ -11,7 +11,10 @@
 #   # Or load into docker:
 #   nix run .#server-image.copyToDockerDaemon
 #
-{ pkgs, lib, pythonPackages, sdkPackages, serverPackages, skillsDir, n2c }:
+{ pkgs, lib, pythonPackages, sdkPackages, serverPackages, skillsDir, n2c
+, sandboxEvalDir ? null  # path to sandbox-eval module directory (eval.nix lives here)
+, kubenixFlake ? null    # kubenix flake input (store path used as flake ref at runtime)
+}:
 
 let
   # Python environment with the full server + SDK
@@ -29,7 +32,7 @@ let
   systemPackages = with pkgs; [
     coreutils bash git gnused gnugrep findutils gawk
     gnutar gzip xz which tmux procps util-linux
-    nix
+    nix jq
   ];
 
   allPackages = systemPackages ++ [ serverPython pkgs.cacert ];
@@ -170,6 +173,10 @@ in {
         "RUNTIME=local"
         "ENABLE_BROWSER=false"
         "SKIP_DEPENDENCY_CHECK=1"
+      ] ++ lib.optionals (sandboxEvalDir != null) [
+        "SANDBOX_EVAL_NIX=${sandboxEvalDir}/eval.nix"
+      ] ++ lib.optionals (kubenixFlake != null) [
+        "KUBENIX_FLAKE=${kubenixFlake}"
       ];
     };
   };
