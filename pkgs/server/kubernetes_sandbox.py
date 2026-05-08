@@ -372,6 +372,7 @@ class KubernetesSandboxService(SandboxService):
 
             exposed_urls = [
                 ExposedUrl(name=AGENT_SERVER, url=external_url, port=_DEFAULT_PORT),
+                ExposedUrl(name=AGENT_SERVER_INTERNAL, url=internal_url, port=_DEFAULT_PORT),
             ]
 
         created_at = datetime.now(timezone.utc)
