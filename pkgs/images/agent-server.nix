@@ -131,11 +131,11 @@ let
       pkgs.cacert
       entrypoint
       lazyChromium
-      lazyVscode
       micromambaShim
       poetryShim
       gitCredentialBroker
-    ] ++ extraPackages;
+    ] ++ lib.optionals (variant != "full") [ lazyVscode ]
+      ++ extraPackages;
 
     # Root filesystem overlay
     rootfs = pkgs.runCommand "openhands-agent-rootfs" {} ''
