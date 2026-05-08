@@ -212,9 +212,27 @@ let
       "GIT_EDITOR=code --wait"
       "OPENVSCODE_SERVER_ROOT=/openhands/.openvscode-server"
     ];
-    # System packages layer — changes rarely, stays cached across pushes.
+    # Layer 1: System packages — changes rarely (coreutils, git, bash, nix, etc.)
     systemLayer = n2c.buildLayer {
       deps = baseSystemPackages ++ variantPackages ++ [ pkgs.nix pkgs.cacert ];
+    };
+
+    # Layer 2: Python + OpenHands SDK — changes on openhands-nix updates
+    pythonLayer = n2c.buildLayer {
+      deps = [ python ];
+    };
+
+    # Layer 3: App overlay — entrypoint, shims, skills, extra packages.
+    # This is the thin layer that changes on most deploys.
+    appLayer = n2c.buildLayer {
+      deps = [
+        entrypoint
+        lazyChromium
+        micromambaShim
+        poetryShim
+        gitCredentialBroker
+      ] ++ lib.optionals (variant != "full") [ lazyVscode ]
+        ++ extraPackages;
     };
 
   in
@@ -223,7 +241,7 @@ let
     initializeNixDatabase = true;
     maxLayers = 80;
 
-    layers = [ systemLayer ];
+    layers = [ systemLayer pythonLayer appLayer ];
     copyToRoot = [ rootfs rootBinEnv ];
 
     config = {
