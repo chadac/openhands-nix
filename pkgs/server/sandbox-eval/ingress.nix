@@ -63,9 +63,8 @@ in
       metadata = {
         namespace = cfg.namespace;
         labels = cfg.labels;
-        annotations = {
-          "external-dns.alpha.kubernetes.io/hostname" = ing.host;
-        } // ing.annotations;
+      } // lib.optionalAttrs (ing.annotations != {}) {
+        annotations = ing.annotations;
       };
       spec = {
         rules = [{
